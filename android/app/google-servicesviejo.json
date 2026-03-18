@@ -1,0 +1,54 @@
+{
+  "project_info": {
+    "project_number": "731751678168",
+    "project_id": "tennis-match-pro",
+    "storage_bucket": "tennis-match-pro.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:731751678168:android:996d9ef0856f1fbd61d7ad",
+        "android_client_info": {
+          "package_name": "com.mathiewman.tennis.tennis_match_pro"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "731751678168-iqo958gh7ia1aujes90f8549fkkep5fn.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.mathiewman.tennis.tennis_match_pro",
+            "certificate_hash": "8df3adc25903a3d112baae5492043c3c4fd22eac"
+          }
+        },
+        {
+          "client_id": "731751678168-k734bu8laj7k2hu29k6p2a3is0trsjqi.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC7XDnhSKSWCPFk6oBdX8Wv-d6jeOiGiI4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "731751678168-k734bu8laj7k2hu29k6p2a3is0trsjqi.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "731751678168-l561g19fd8qhn0nd28rlavp3ajossuk0.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.mathiewman.tennis.tennisMatchPro"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
