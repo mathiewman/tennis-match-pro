@@ -248,11 +248,7 @@ class _TournamentManagementScreenState
   late final BracketLayout _layout;
   RankingConfig _rankingConfig = const RankingConfig();
   String? _lastRecalculatedTournamentId;
-  bool _isRankingConfigLoaded = false;
-
-  // Control de zoom y posición inicial
-  final TransformationController _transformCtrl = TransformationController();
-  bool _initialPositionSet = false;
+  bool _isRankingConfigLoaded = false; // ADDED: Flag to track ranking config loading
 
   @override
   void initState() {
@@ -260,58 +256,6 @@ class _TournamentManagementScreenState
     _layout = BracketLayout(_nearestValidCount(widget.playerCount));
     _loadUserRole();
     _loadRankingConfig();
-  }
-
-  @override
-  void dispose() {
-    _transformCtrl.dispose();
-    super.dispose();
-  }
-
-  /// Detecta la ronda activa (última con al menos un partido jugado)
-  /// y centra la vista ahí con zoom legible.
-  /// Si no hay ningún partido jugado, centra en la ronda 0 (primera ronda).
-  void _setInitialPosition(Map<int, Map<String, dynamic>> slots, Size screenSize) {
-    if (_initialPositionSet) return;
-    _initialPositionSet = true;
-
-    // Encontrar la ronda más avanzada con al menos un resultado cargado
-    int activeRound = 0;
-    for (final mp in _layout.matches) {
-      final s1 = slots[mp.slotP1];
-      final s2 = slots[mp.slotP2];
-      final hasResult = (s1?['score'] as List?)?.isNotEmpty == true ||
-          (s2?['score'] as List?)?.isNotEmpty == true;
-      if (hasResult && mp.round >= activeRound) {
-        activeRound = mp.round;
-      }
-    }
-
-    // Buscar todos los matches de esa ronda
-    final matchesInRound = _layout.matches
-        .where((mp) => mp.round == activeRound)
-        .toList();
-
-    if (matchesInRound.isEmpty) return;
-
-    // Posición X: la columna de esa ronda
-    final double targetX = matchesInRound.first.x;
-
-    // Posición Y: centro vertical de todos los matches de esa ronda
-    final double minY = matchesInRound.map((m) => m.y).reduce((a, b) => a < b ? a : b);
-    final double maxY = matchesInRound.map((m) => m.y).reduce((a, b) => a > b ? a : b) + kMatchH;
-    final double targetY = (minY + maxY) / 2;
-
-    // Zoom según cantidad de matches en la ronda
-    final double scale = matchesInRound.length <= 4 ? 1.0 : 0.75;
-
-    // Centrar la vista: mover el canvas para que targetX,targetY quede en el centro de pantalla
-    final double offsetX = -(targetX * scale) + (screenSize.width  / 2) - (kMatchW * scale / 2) - 60;
-    final double offsetY = -(targetY * scale) + (screenSize.height / 2) - 60;
-
-    _transformCtrl.value = Matrix4.identity()
-      ..scale(scale)
-      ..translate(offsetX / scale, offsetY / scale);
   }
 
   int _nearestValidCount(int n) {
@@ -366,19 +310,86 @@ class _TournamentManagementScreenState
   void _saveResult(
       int p1, int p2, int nextSlot,
       List<String> score, int winnerSlot,
-      Map<int, Map<String, dynamic>> slots,
-      ) {
-    final updated = Map<int, Map<String, dynamic>>.from(slots);
-    updated[p1] = {...(slots[p1] ?? {}), 'score': score, 'winner': p1 == winnerSlot};
-    updated[p2] = {...(slots[p2] ?? {}), 'score': score, 'winner': p2 == winnerSlot};
+      Map<int, Map<String, dynamic>> slots, {
+        String? specialResult,
+        int? woAbsentSlot,    // slot del ausente en W.O.
+        int? abandonSlot,     // slot del que abandonó
+      }) {
+    final updated  = Map<int, Map<String, dynamic>>.from(slots);
+    final loserSlot = winnerSlot == p1 ? p2 : p1;
+
+    updated[p1] = {
+      ...(slots[p1] ?? {}),
+      'score':         score,
+      'winner':        p1 == winnerSlot,
+      'specialResult': specialResult ?? 'normal',
+      // W.O.: marcar ausente solo en el que no se presentó
+      'absent':   specialResult == 'walkover' && p1 == woAbsentSlot,
+      // Abandono: marcar solo en el que abandonó
+      'abandono': specialResult == 'abandono' && p1 == abandonSlot,
+    };
+    updated[p2] = {
+      ...(slots[p2] ?? {}),
+      'score':         score,
+      'winner':        p2 == winnerSlot,
+      'specialResult': specialResult ?? 'normal',
+      'absent':   specialResult == 'walkover' && p2 == woAbsentSlot,
+      'abandono': specialResult == 'abandono' && p2 == abandonSlot,
+    };
+
     if (nextSlot != -1) {
       final w = updated[winnerSlot]!;
       updated[nextSlot] = {
-        'name':     w['name']     ?? '',
-        'phone':    w['phone']    ?? '',
-        'photoUrl': w['photoUrl'] ?? '',
+        'name':          w['name']     ?? '',
+        'phone':         w['phone']    ?? '',
+        'photoUrl':      w['photoUrl'] ?? '',
+        'score':         [],
+        'winner':        false,
+        'specialResult': 'normal',
+        'absent':        false,
+        'abandono':      false,
+        'hadBye':        w['isBye'] == true || w['hadBye'] == true,
+      };
+    }
+    _persist(updated).then((_) => _triggerStatsRecalc(updated));
+  }
+
+  // ── ASIGNAR BYE ───────────────────────────────────────────────────────────
+  /// Marca un slot vacío como BYE — el jugador del slot opuesto avanza automáticamente.
+  void _assignBye(int emptySlot, Map<int, Map<String, dynamic>> slots) {
+    final mp = _layout.matchForSlot(emptySlot);
+    if (mp == null) return;
+
+    final opponentSlot = mp.slotP1 == emptySlot ? mp.slotP2 : mp.slotP1;
+    final opponent     = slots[opponentSlot];
+    if (opponent == null || (opponent['name'] ?? '').toString().isEmpty) return;
+
+    final updated = Map<int, Map<String, dynamic>>.from(slots);
+
+    // Marcar el slot vacío como BYE
+    updated[emptySlot] = {
+      'name':   'BYE',
+      'isBye':  true,
+      'score':  [],
+      'winner': false,
+    };
+    // El oponente avanza sin jugar
+    updated[opponentSlot] = {
+      ...opponent,
+      'winner': true,
+      'score':  ['BYE'],
+      'specialResult': 'bye',
+    };
+    // Avanzar al ganador al siguiente slot
+    if (mp.nextSlot != -1) {
+      updated[mp.nextSlot] = {
+        'name':     opponent['name']     ?? '',
+        'phone':    opponent['phone']    ?? '',
+        'photoUrl': opponent['photoUrl'] ?? '',
         'score':    [],
         'winner':   false,
+        'hadBye':   true,
+        'specialResult': 'normal',
       };
     }
     _persist(updated).then((_) => _triggerStatsRecalc(updated));
@@ -411,35 +422,87 @@ class _TournamentManagementScreenState
   }
 
   // ── ELIMINAR RESULTADO ────────────────────────────────────────────────────
+  /// Borra el resultado del partido pero MANTIENE los jugadores en sus slots.
+  /// Solo limpia scores, winner flags y specialResult.
+  /// Si el ganador había avanzado al siguiente slot, lo limpia también.
   void _deleteResult(MatchPosition mp, Map<int, Map<String, dynamic>> slots) {
     final updated = Map<int, Map<String, dynamic>>.from(slots);
-    updated[mp.slotP1] = {...(slots[mp.slotP1] ?? {}), 'score': [], 'winner': false};
-    updated[mp.slotP2] = {...(slots[mp.slotP2] ?? {}), 'score': [], 'winner': false};
 
+    // Limpiar resultado de P1 y P2 — pero conservar nombre, teléfono, foto
+    updated[mp.slotP1] = {
+      ...(slots[mp.slotP1] ?? {}),
+      'score':         [],
+      'winner':        false,
+      'specialResult': 'normal',
+      'absent':        false,
+      'abandono':      false,
+    };
+    updated[mp.slotP2] = {
+      ...(slots[mp.slotP2] ?? {}),
+      'score':         [],
+      'winner':        false,
+      'specialResult': 'normal',
+      'absent':        false,
+      'abandono':      false,
+    };
+
+    // Al borrar un resultado, el ganador que había avanzado debe retroceder.
+    // IMPORTANTE: solo se limpia el slot SIGUIENTE y en cascada hacia adelante.
+    // Los nombres de P1 y P2 en este match se CONSERVAN — solo se borra el resultado.
     if (mp.nextSlot != -1) {
-      final p1n = slots[mp.slotP1]?['name'] ?? '';
-      final p2n = slots[mp.slotP2]?['name'] ?? '';
-      final nn  = slots[mp.nextSlot]?['name'] ?? '';
-      if (nn.isNotEmpty && (nn == p1n || nn == p2n)) {
-        _cascadeClearByName(updated, nn, startSlot: mp.nextSlot);
+      final p1Name   = (slots[mp.slotP1]?['name'] ?? '').toString();
+      final p2Name   = (slots[mp.slotP2]?['name'] ?? '').toString();
+      final nextName = (slots[mp.nextSlot]?['name'] ?? '').toString();
+      // Solo limpiar si el jugador del slot siguiente proviene de este match
+      if (nextName.isNotEmpty &&
+          (nextName == p1Name || nextName == p2Name)) {
+        // Limpiar el slot siguiente — pero sin borrar el nombre si quedó por BYE
+        final wasBye = slots[mp.nextSlot]?['hadBye'] == true;
+        updated[mp.nextSlot] = {
+          'name': '', 'phone': '', 'photoUrl': '',
+          'score': [], 'winner': false, 'specialResult': 'normal',
+          'absent': false, 'abandono': false,
+        };
+        // Cascada: limpiar slots más adelante donde el mismo jugador avanzó
+        if (!wasBye) {
+          _cascadeClearByName(updated, nextName, startSlot: mp.nextSlot);
+        }
       }
     }
-    _persist(updated).then((_) => _triggerStatsRecalc(updated)); // ADDED: Trigger recalc after deleting result
+
+    _persist(updated).then((_) => _triggerStatsRecalc(updated));
   }
 
   // ── AGREGAR JUGADOR ───────────────────────────────────────────────────────
   void _addPlayer(int slotIndex, Map<int, Map<String, dynamic>> slots) {
+    // Verificar si el slot opuesto tiene jugador — si sí, ofrecer BYE también
+    final mp           = _layout.matchForSlot(slotIndex);
+    final opponentSlot = mp == null
+        ? null
+        : (mp.slotP1 == slotIndex ? mp.slotP2 : mp.slotP1);
+    final opponentName = opponentSlot != null
+        ? (slots[opponentSlot]?['name'] ?? '').toString()
+        : '';
+    final canBye = opponentName.isNotEmpty && opponentName != 'BYE';
+
     showDialog(
       context: context,
       builder: (_) => _PlayerModal(
-        title: 'AGREGAR JUGADOR',
+        title:   'AGREGAR JUGADOR',
+        canBye:  canBye,
+        onBye:   canBye
+            ? () {
+          Navigator.pop(context);
+          _assignBye(slotIndex, slots);
+        }
+            : null,
         onSave: (name, phone) {
           final updated = Map<int, Map<String, dynamic>>.from(slots);
           updated[slotIndex] = {
             'name': name, 'phone': phone,
             'photoUrl': '', 'score': [], 'winner': false,
           };
-          _persist(updated).then((_) => _triggerStatsRecalc(updated)); // ADDED: Trigger recalc after adding player
+          _persist(updated).then((_) => _triggerStatsRecalc(updated));
         },
       ),
     );
@@ -543,12 +606,54 @@ class _TournamentManagementScreenState
 
   // ── EDITAR SCORE ──────────────────────────────────────────────────────────
   void _editScore(MatchPosition mp, Map<int, Map<String, dynamic>> slots) {
+    final s1 = slots[mp.slotP1];
+    final s2 = slots[mp.slotP2];
+    final n1 = (s1?['name'] ?? '').toString();
+    final n2 = (s2?['name'] ?? '').toString();
+
+    // Si uno está vacío, ofrecer BYE
+    if ((n1.isEmpty || n1 == 'BYE') && n2.isNotEmpty && n2 != 'BYE') {
+      _showByeDialog(mp.slotP1, mp, slots);
+      return;
+    }
+    if ((n2.isEmpty || n2 == 'BYE') && n1.isNotEmpty && n1 != 'BYE') {
+      _showByeDialog(mp.slotP2, mp, slots);
+      return;
+    }
+
     showDialog(
       context: context,
       builder: (_) => _ScoreModal(
         mp: mp, slots: slots,
         onSave:   _saveResult,
         onDelete: _deleteResult,
+      ),
+    );
+  }
+
+  void _showByeDialog(int emptySlot, MatchPosition mp, Map<int, Map<String, dynamic>> slots) {
+    final opponentSlot = mp.slotP1 == emptySlot ? mp.slotP2 : mp.slotP1;
+    final opponentName = slots[opponentSlot]?['name'] ?? 'el jugador';
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF0D1220),
+        title: const Text('Slot vacío', style: TextStyle(color: Colors.white, fontSize: 14)),
+        content: Text(
+          '¿Asignás BYE? $opponentName avanzará automáticamente.',
+          style: const TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCELAR', style: TextStyle(color: Colors.white38)),
+          ),
+          ElevatedButton(
+            onPressed: () { Navigator.pop(context); _assignBye(emptySlot, slots); },
+            style: ElevatedButton.styleFrom(backgroundColor: kYellow),
+            child: const Text('ASIGNAR BYE', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+          ),
+        ],
       ),
     );
   }
@@ -585,13 +690,7 @@ class _TournamentManagementScreenState
           final screenW  = MediaQuery.of(context).size.width;
           final minScale = ((screenW - 40) / _layout.totalWidth).clamp(0.01, 1.0);
 
-          // Setear posición inicial una sola vez cuando llegan los datos
-          if (snapshot.hasData) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              _setInitialPosition(slots, MediaQuery.of(context).size);
-            });
-          }
-
+          // MODIFIED: Trigger stats recalculation when slots data and ranking config are available
           if (snapshot.hasData && snapshot.data!.exists && _isRankingConfigLoaded && _lastRecalculatedTournamentId != widget.tournamentId) {
             WidgetsBinding.instance.addPostFrameCallback((_) {
               _triggerStatsRecalc(slots);
@@ -599,7 +698,6 @@ class _TournamentManagementScreenState
           }
 
           return InteractiveViewer(
-            transformationController: _transformCtrl,
             minScale:        minScale,
             maxScale:        3.0,
             boundaryMargin:  const EdgeInsets.all(4000),
@@ -860,9 +958,14 @@ class _PlayerRow extends StatelessWidget {
     this.onDeletePlayer, this.onEditScore,
   });
 
-  bool   get _hasPlayer => data != null && (data!['name'] ?? '').toString().isNotEmpty;
-  String get _name      => _hasPlayer ? (data!['name'] as String).toUpperCase() : '';
-  bool   get _isWinner  => data?['winner'] == true;
+  bool   get _hasPlayer  => data != null && (data!['name'] ?? '').toString().isNotEmpty && data!['name'] != 'BYE';
+  String get _name       => _hasPlayer ? (data!['name'] as String).toUpperCase() : '';
+  bool   get _isWinner   => data?['winner'] == true;
+  bool   get _isBye      => data?['isBye'] == true || data?['name'] == 'BYE';
+  // W.O.: badge solo en el AUSENTE (absent == true), no en el ganador
+  bool   get _isWalkover => data?['absent'] == true;
+  // Abandono: badge solo en el que ABANDONÓ (abandono == true), no en el ganador
+  bool   get _isAbandono => data?['abandono'] == true;
 
   @override
   Widget build(BuildContext context) {
@@ -944,46 +1047,89 @@ class _PlayerRow extends StatelessWidget {
   }
 
   Widget _buildName() {
-    if (!isAdmin) {
-      return Text(
-        _hasPlayer ? _name : 'ESPERANDO...',
+    // BYE
+    if (_isBye) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+        decoration: BoxDecoration(
+          color: Colors.white.withAlpha(15),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: const Text('BYE', style: TextStyle(
+            color: Colors.white38, fontSize: 9,
+            fontWeight: FontWeight.bold, letterSpacing: 1)),
+      );
+    }
+
+    // Badge correcto:
+    // W.O. → solo en el ausente (absent == true)
+    // ABD  → solo en el que abandonó (abandono == true)
+    Widget? badge;
+    final isAbsent   = data?['absent']   == true;
+    final isAbandono = data?['abandono'] == true;
+
+    if (isAbsent) {
+      badge = _specialBadge('W.O.', Colors.orangeAccent);
+    } else if (isAbandono) {
+      badge = _specialBadge('ABD', Colors.redAccent);
+    }
+
+    final nameWidget = _hasPlayer
+        ? (isAdmin
+        ? GestureDetector(
+      onTap: () => onEditPlayer?.call(slotIndex, data!),
+      child: Text(_name,
         style: TextStyle(
-          color: _hasPlayer ? (_isWinner ? Colors.white : Colors.white60) : Colors.white.withAlpha(51),
+          color: _isWinner ? Colors.white : Colors.white70,
           fontSize: 10, letterSpacing: 0.3,
           fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
+          decoration: TextDecoration.underline,
+          decorationColor: Colors.white24,
+          decorationStyle: TextDecorationStyle.dotted,
         ),
         overflow: TextOverflow.ellipsis,
-      );
-    }
-    if (_hasPlayer) {
-      return GestureDetector(
-        onTap: () => onEditPlayer?.call(slotIndex, data!),
-        child: Text(_name,
-          style: TextStyle(
-            color: _isWinner ? Colors.white : Colors.white70,
-            fontSize: 10, letterSpacing: 0.3,
-            fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
-            decoration: TextDecoration.underline,
-            decorationColor: Colors.white24,
-            decorationStyle: TextDecorationStyle.dotted,
-          ),
-          overflow: TextOverflow.ellipsis,
-        ),
-      );
-    }
-    if (mp.round == 0) {
-      return GestureDetector(
-        onTap: () => onAddPlayer?.call(slotIndex),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(Icons.add_circle_outline, color: Colors.white38, size: 13),
-          const SizedBox(width: 3),
-          const Text('AGREGAR',
-              style: TextStyle(color: Colors.white38, fontSize: 9)),
-        ]),
-      );
-    }
-    return Text('ESPERANDO...',
-        style: TextStyle(color: Colors.white.withAlpha(51), fontSize: 10));
+      ),
+    )
+        : Text(
+      _hasPlayer ? _name : 'ESPERANDO...',
+      style: TextStyle(
+        color: _hasPlayer ? (_isWinner ? Colors.white : Colors.white60) : Colors.white.withAlpha(51),
+        fontSize: 10, letterSpacing: 0.3,
+        fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
+      ),
+      overflow: TextOverflow.ellipsis,
+    ))
+        : (mp.round == 0 && isAdmin
+        ? GestureDetector(
+      onTap: () => onAddPlayer?.call(slotIndex),
+      child: Row(mainAxisSize: MainAxisSize.min, children: [
+        Icon(Icons.add_circle_outline, color: Colors.white38, size: 13),
+        const SizedBox(width: 3),
+        const Text('AGREGAR', style: TextStyle(color: Colors.white38, fontSize: 9)),
+      ]),
+    )
+        : Text('ESPERANDO...', style: TextStyle(color: Colors.white.withAlpha(51), fontSize: 10)));
+
+    if (badge == null) return nameWidget;
+    return Row(mainAxisSize: MainAxisSize.min, children: [
+      Flexible(child: nameWidget),
+      const SizedBox(width: 5),
+      badge,
+    ]);
+  }
+
+  Widget _specialBadge(String label, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: color.withAlpha(30),
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: color.withAlpha(80), width: 0.5),
+      ),
+      child: Text(label, style: TextStyle(
+          color: color, fontSize: 8,
+          fontWeight: FontWeight.bold, letterSpacing: 0.5)),
+    );
   }
 
   Future<void> _launchWA(String phone, String name, String? rival) async {
@@ -1034,10 +1180,14 @@ class _ScoreCell extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 // MODAL DE SCORE
 // ─────────────────────────────────────────────────────────────────────────────
+// Tipos especiales de resultado
+enum SpecialResult { none, walkover, abandono }
+
 class _ScoreModal extends StatefulWidget {
   final MatchPosition                  mp;
   final Map<int, Map<String, dynamic>> slots;
-  final Function(int, int, int, List<String>, int, Map<int, Map<String, dynamic>>) onSave;
+  final Function(int, int, int, List<String>, int, Map<int, Map<String, dynamic>>,
+      {String? specialResult, int? woAbsentSlot, int? abandonSlot}) onSave;
   final Function(MatchPosition, Map<int, Map<String, dynamic>>) onDelete;
 
   const _ScoreModal({
@@ -1051,6 +1201,7 @@ class _ScoreModal extends StatefulWidget {
 
 class _ScoreModalState extends State<_ScoreModal> {
   late final List<TextEditingController> _c1, _c2;
+  SpecialResult _specialResult = SpecialResult.none;
 
   String get _n1 =>
       (widget.slots[widget.mp.slotP1]?['name'] ?? 'Jugador 1').toString();
@@ -1079,7 +1230,7 @@ class _ScoreModalState extends State<_ScoreModal> {
     super.dispose();
   }
 
-  int _winner() {
+  int _winnerFromScore() {
     int s1 = 0, s2 = 0;
     for (int i = 0; i < 3; i++) {
       final v1 = int.tryParse(_c1[i].text) ?? 0;
@@ -1097,9 +1248,137 @@ class _ScoreModalState extends State<_ScoreModal> {
     final scores = List.generate(3, (i) =>
     '${_c1[i].text.isEmpty ? '0' : _c1[i].text}'
         '-${_c2[i].text.isEmpty ? '0' : _c2[i].text}');
-    widget.onSave(widget.mp.slotP1, widget.mp.slotP2,
-        widget.mp.nextSlot, scores, _winner(), widget.slots);
-    Navigator.pop(context);
+
+    switch (_specialResult) {
+      case SpecialResult.none:
+        widget.onSave(
+          widget.mp.slotP1, widget.mp.slotP2,
+          widget.mp.nextSlot, scores, _winnerFromScore(), widget.slots,
+        );
+        Navigator.pop(context);
+        break;
+      case SpecialResult.walkover:
+      // Preguntamos quién NO se presentó
+        _showWOPicker(scores);
+        break;
+      case SpecialResult.abandono:
+      // Preguntamos quién abandonó
+        _showAbandonoPicker(scores);
+        break;
+    }
+  }
+
+  /// W.O. — elegir el AUSENTE. El ganador es el otro automáticamente.
+  void _showWOPicker(List<String> scores) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF0D1220),
+        title: const Text('¿Quién NO se presentó?',
+            style: TextStyle(color: Colors.white, fontSize: 14,
+                fontWeight: FontWeight.bold)),
+        content: Text(
+          'El jugador ausente queda con badge W.O.\nEl otro avanza automáticamente.',
+          style: TextStyle(color: Colors.orangeAccent.withAlpha(180),
+              fontSize: 11, height: 1.5),
+        ),
+        actions: [
+          // P1 es el ausente → P2 gana
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context); // cerrar picker
+              Navigator.pop(context); // cerrar modal score
+              widget.onSave(
+                widget.mp.slotP1, widget.mp.slotP2,
+                widget.mp.nextSlot, scores,
+                widget.mp.slotP2, // ganador = P2
+                widget.slots,
+                specialResult: 'walkover',
+                woAbsentSlot: widget.mp.slotP1, // ausente = P1
+              );
+            },
+            child: Text(_n1.toUpperCase(),
+                style: const TextStyle(
+                    color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+          ),
+          // P2 es el ausente → P1 gana
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.pop(context);
+              widget.onSave(
+                widget.mp.slotP1, widget.mp.slotP2,
+                widget.mp.nextSlot, scores,
+                widget.mp.slotP1, // ganador = P1
+                widget.slots,
+                specialResult: 'walkover',
+                woAbsentSlot: widget.mp.slotP2, // ausente = P2
+              );
+            },
+            child: Text(_n2.toUpperCase(),
+                style: const TextStyle(
+                    color: Colors.orangeAccent, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// ABANDONO — elegir quién abandonó. El ganador es el otro.
+  /// El score queda como estaba (parcial), las stats se completan en el calculator.
+  void _showAbandonoPicker(List<String> scores) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        backgroundColor: const Color(0xFF0D1220),
+        title: const Text('¿Quién abandonó?',
+            style: TextStyle(color: Colors.white, fontSize: 14,
+                fontWeight: FontWeight.bold)),
+        content: Text(
+          'El score queda como quedó.\nLas estadísticas se completan a favor del ganador.',
+          style: TextStyle(color: Colors.redAccent.withAlpha(180),
+              fontSize: 11, height: 1.5),
+        ),
+        actions: [
+          // P1 abandonó → P2 gana
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.pop(context);
+              widget.onSave(
+                widget.mp.slotP1, widget.mp.slotP2,
+                widget.mp.nextSlot, scores,
+                widget.mp.slotP2, // ganador = P2
+                widget.slots,
+                specialResult: 'abandono',
+                abandonSlot: widget.mp.slotP1, // abandonó P1
+              );
+            },
+            child: Text(_n1.toUpperCase(),
+                style: const TextStyle(
+                    color: Colors.redAccent, fontWeight: FontWeight.bold)),
+          ),
+          // P2 abandonó → P1 gana
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              Navigator.pop(context);
+              widget.onSave(
+                widget.mp.slotP1, widget.mp.slotP2,
+                widget.mp.nextSlot, scores,
+                widget.mp.slotP1, // ganador = P1
+                widget.slots,
+                specialResult: 'abandono',
+                abandonSlot: widget.mp.slotP2, // abandonó P2
+              );
+            },
+            child: Text(_n2.toUpperCase(),
+                style: const TextStyle(
+                    color: Colors.redAccent, fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1107,48 +1386,151 @@ class _ScoreModalState extends State<_ScoreModal> {
     return Dialog(
       backgroundColor: Colors.transparent,
       insetPadding: const EdgeInsets.all(20),
-      child: Container(
-        width: 400,
-        decoration: BoxDecoration(
-          color: const Color(0xFF0D1220),
-          borderRadius: BorderRadius.circular(14),
-          border: Border.all(color: kYellow.withAlpha(51)),
-          boxShadow: [BoxShadow(color: Colors.black.withAlpha(179),
-              blurRadius: 40, spreadRadius: 8)],
-        ),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          _header('CARGAR RESULTADO', Icons.sports_tennis),
-          Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(children: [
-              Row(children: [
-                const Expanded(child: SizedBox()),
-                ...['SET 1', 'SET 2', 'SET 3'].map((s) => SizedBox(width: 50,
-                    child: Center(child: Text(s, style: const TextStyle(
-                        color: Color(0xFF3A5080), fontSize: 8,
-                        letterSpacing: 1.5, fontWeight: FontWeight.bold))))),
-              ]),
-              const SizedBox(height: 12),
-              _inputRow(_n1, _c1),
-              const SizedBox(height: 6),
-              _vsDivider(),
-              const SizedBox(height: 6),
-              _inputRow(_n2, _c2),
-              const SizedBox(height: 22),
-              Row(children: [
-                Expanded(child: _outlineBtn('CANCELAR',
-                        () => Navigator.pop(context))),
-                const SizedBox(width: 8),
-                Expanded(flex: 2, child: _solidBtn('GUARDAR', _save)),
-                const SizedBox(width: 8),
-                Expanded(child: _dangerBtn('BORRAR', () {
-                  widget.onDelete(widget.mp, widget.slots);
-                  Navigator.pop(context);
-                })),
-              ]),
-            ]),
+      child: SingleChildScrollView(
+        child: Container(
+          width: 400,
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D1220),
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: kYellow.withAlpha(51)),
+            boxShadow: [BoxShadow(color: Colors.black.withAlpha(179),
+                blurRadius: 40, spreadRadius: 8)],
           ),
+          child: Column(mainAxisSize: MainAxisSize.min, children: [
+            _header('CARGAR RESULTADO', Icons.sports_tennis),
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(children: [
+
+                // Tipo de resultado especial
+                _buildSpecialResultToggle(),
+                const SizedBox(height: 16),
+
+                // Score (solo visible si no es W.O. puro)
+                if (_specialResult != SpecialResult.walkover) ...[
+                  Row(children: [
+                    const Expanded(child: SizedBox()),
+                    ...['SET 1', 'SET 2', 'SET 3'].map((s) => SizedBox(width: 50,
+                        child: Center(child: Text(s, style: const TextStyle(
+                            color: Color(0xFF3A5080), fontSize: 8,
+                            letterSpacing: 1.5, fontWeight: FontWeight.bold))))),
+                  ]),
+                  const SizedBox(height: 12),
+                  _inputRow(_n1, _c1),
+                  const SizedBox(height: 6),
+                  _vsDivider(),
+                  const SizedBox(height: 6),
+                  _inputRow(_n2, _c2),
+                ] else ...[
+                  // W.O.: solo mostrar los nombres
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.orangeAccent.withAlpha(15),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.orangeAccent.withAlpha(40)),
+                    ),
+                    child: Row(children: [
+                      const Icon(Icons.warning_amber_rounded,
+                          color: Colors.orangeAccent, size: 16),
+                      const SizedBox(width: 10),
+                      Expanded(child: Text(
+                        'El rival no se presentó. Al guardar elegís quién ganó. El ganador suma PJ pero no %G.',
+                        style: TextStyle(color: Colors.orangeAccent.withAlpha(200),
+                            fontSize: 10, height: 1.4),
+                      )),
+                    ]),
+                  ),
+                ],
+
+                // Info de abandono
+                if (_specialResult == SpecialResult.abandono) ...[
+                  const SizedBox(height: 10),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.redAccent.withAlpha(15),
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.redAccent.withAlpha(40)),
+                    ),
+                    child: Row(children: [
+                      const Icon(Icons.exit_to_app,
+                          color: Colors.redAccent, size: 16),
+                      const SizedBox(width: 10),
+                      Expanded(child: Text(
+                        'Cargá el score como quedó. Al guardar te preguntará quién abandonó.',
+                        style: TextStyle(color: Colors.redAccent.withAlpha(200),
+                            fontSize: 10, height: 1.4),
+                      )),
+                    ]),
+                  ),
+                ],
+
+                const SizedBox(height: 22),
+                Row(children: [
+                  Expanded(child: _outlineBtn('CANCELAR',
+                          () => Navigator.pop(context))),
+                  const SizedBox(width: 8),
+                  Expanded(flex: 2, child: _solidBtn('GUARDAR', _save)),
+                  const SizedBox(width: 8),
+                  Expanded(child: _dangerBtn('BORRAR', () {
+                    widget.onDelete(widget.mp, widget.slots);
+                    Navigator.pop(context);
+                  })),
+                ]),
+              ]),
+            ),
+          ]),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSpecialResultToggle() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('TIPO DE RESULTADO',
+            style: TextStyle(color: Colors.white.withAlpha(77),
+                fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 1.5)),
+        const SizedBox(height: 8),
+        Row(children: [
+          _typeChip('NORMAL',   SpecialResult.none,     Colors.white38),
+          const SizedBox(width: 8),
+          _typeChip('W.O.',     SpecialResult.walkover, Colors.orangeAccent),
+          const SizedBox(width: 8),
+          _typeChip('ABANDONO', SpecialResult.abandono, Colors.redAccent),
         ]),
+      ],
+    );
+  }
+
+  Widget _typeChip(String label, SpecialResult type, Color color) {
+    final selected = _specialResult == type;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _specialResult = type),
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 150),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: selected ? color.withAlpha(30) : Colors.black.withAlpha(60),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: selected ? color : Colors.white.withAlpha(20),
+              width: selected ? 1.5 : 1,
+            ),
+          ),
+          child: Center(
+            child: Text(label,
+                style: TextStyle(
+                  color: selected ? color : Colors.white38,
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1,
+                )),
+          ),
+        ),
       ),
     );
   }
@@ -1238,14 +1620,18 @@ class _ScoreModalState extends State<_ScoreModal> {
 // MODAL DE JUGADOR
 // ─────────────────────────────────────────────────────────────────────────────
 class _PlayerModal extends StatefulWidget {
-  final String  title;
-  final String? initialName;
-  final String? initialPhone;
+  final String        title;
+  final String?       initialName;
+  final String?       initialPhone;
+  final bool          canBye;
+  final VoidCallback? onBye;
   final Function(String, String) onSave;
 
   const _PlayerModal({
     required this.title,
     this.initialName, this.initialPhone,
+    this.canBye  = false,
+    this.onBye,
     required this.onSave,
   });
 
@@ -1290,6 +1676,32 @@ class _PlayerModalState extends State<_PlayerModal> {
               _field('CELULAR (WhatsApp)', _phoneCtrl,
                   type: TextInputType.phone),
               const SizedBox(height: 24),
+
+              // Botón BYE (solo cuando hay oponente)
+              if (widget.canBye && widget.onBye != null) ...[
+                GestureDetector(
+                  onTap: widget.onBye,
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withAlpha(10),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.white.withAlpha(30)),
+                    ),
+                    child: const Center(
+                      child: Text('ASIGNAR BYE',
+                          style: TextStyle(
+                              color: Colors.white54,
+                              fontSize: 10,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 1.5)),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+
               Row(children: [
                 Expanded(child: TextButton(
                   onPressed: () => Navigator.pop(context),
