@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:intl/intl.dart';
 import 'stats_calculator.dart';
 import 'tournament_stats_screen.dart';
 
@@ -604,6 +605,71 @@ class _TournamentManagementScreenState
     }
   }
 
+  // ── ASIGNAR TURNO DE TORNEO A UNA CANCHA ─────────────────────────────────
+  void _showAssignTurnModal(
+      MatchPosition mp, Map<int, Map<String, dynamic>> slots) {
+    final s1 = slots[mp.slotP1];
+    final s2 = slots[mp.slotP2];
+    final n1 = (s1?['name'] ?? '').toString();
+    final n2 = (s2?['name'] ?? '').toString();
+    if (n1.isEmpty || n2.isEmpty || n1 == 'BYE' || n2 == 'BYE') return;
+
+    showDialog(
+      context: context,
+      builder: (_) => _AssignTurnModal(
+        clubId:         widget.clubId,
+        tournamentId:   widget.tournamentId,
+        mp:             mp,
+        slots:          slots,
+        onAssigned: (date, time, courtId, courtName, {String? endTime}) async {
+          // Guardar el turno en el slot del layout
+          final updated = Map<int, Map<String, dynamic>>.from(slots);
+          final slotData = {
+            'date':       date,
+            'time':       time,
+            'endTime':    endTime ?? '',
+            'courtId':    courtId,
+            'courtName':  courtName,
+          };
+          updated[mp.slotP1] = {
+            ...(slots[mp.slotP1] ?? {}),
+            'matchSlot': slotData,
+          };
+          updated[mp.slotP2] = {
+            ...(slots[mp.slotP2] ?? {}),
+            'matchSlot': slotData,
+          };
+          await _persist(updated);
+
+          // Mandar WhatsApp a ambos si tienen teléfono
+          final phone1 = (s1?['phone'] ?? '').toString();
+          final phone2 = (s2?['phone'] ?? '').toString();
+          final msg = 'Hola! Tu partido de torneo contra '
+              '{rival} está programado para el $date a las $time '
+              'en $courtName. 🎾';
+          if (phone1.isNotEmpty) {
+            final clean1 = phone1.replaceAll(RegExp(r'[^\d]'), '');
+            final m1 = msg.replaceAll('{rival}', n2);
+            final url1 = Uri.parse(
+                'https://wa.me/549$clean1?text=${Uri.encodeComponent(m1)}');
+            if (await canLaunchUrl(url1)) {
+              await launchUrl(url1, mode: LaunchMode.externalApplication);
+            }
+          }
+          if (phone2.isNotEmpty) {
+            final clean2 = phone2.replaceAll(RegExp(r'[^\d]'), '');
+            final m2 = msg.replaceAll('{rival}', n1);
+            final url2 = Uri.parse(
+                'https://wa.me/549$clean2?text=${Uri.encodeComponent(m2)}');
+            if (await canLaunchUrl(url2)) {
+              await launchUrl(url2, mode: LaunchMode.externalApplication);
+            }
+          }
+        },
+      ),
+    );
+  }
+
   // ── EDITAR SCORE ──────────────────────────────────────────────────────────
   void _editScore(MatchPosition mp, Map<int, Map<String, dynamic>> slots) {
     final s1 = slots[mp.slotP1];
@@ -709,10 +775,11 @@ class _TournamentManagementScreenState
                 slots:          slots,
                 isAdmin:        _isAdmin,
                 onSave:         _saveResult,
-                onAddPlayer:    _isAdmin ? (i)       => _addPlayer(i, slots)         : null,
-                onEditPlayer:   _isAdmin ? (i, data) => _editPlayer(i, data, slots)  : null,
-                onDeletePlayer: _isAdmin ? (i)       => _deletePlayer(i, slots)      : null,
-                onEditScore:    _isAdmin ? (mp)      => _editScore(mp, slots)        : null,
+                onAddPlayer:    _isAdmin ? (i)       => _addPlayer(i, slots)              : null,
+                onEditPlayer:   _isAdmin ? (i, data) => _editPlayer(i, data, slots)       : null,
+                onDeletePlayer: _isAdmin ? (i)       => _deletePlayer(i, slots)           : null,
+                onEditScore:    _isAdmin ? (mp)      => _editScore(mp, slots)             : null,
+                onAssignTurn:   _isAdmin ? (mp)      => _showAssignTurnModal(mp, slots)   : null,
               ),
             ),
           );
@@ -793,6 +860,7 @@ class _BracketCanvas extends StatelessWidget {
   final Function(int, Map<String, dynamic>)? onEditPlayer;
   final Function(int)?                       onDeletePlayer;
   final Function(MatchPosition)?             onEditScore;
+  final Function(MatchPosition)?             onAssignTurn;
 
   const _BracketCanvas({
     required this.layout,
@@ -803,6 +871,7 @@ class _BracketCanvas extends StatelessWidget {
     this.onEditPlayer,
     this.onDeletePlayer,
     this.onEditScore,
+    this.onAssignTurn,
   });
 
   String _roundLabel(int r) {
@@ -866,6 +935,7 @@ class _BracketCanvas extends StatelessWidget {
                 onEditPlayer:   onEditPlayer,
                 onDeletePlayer: onDeletePlayer,
                 onEditScore:    onEditScore,
+                onAssignTurn:   onAssignTurn,
               ),
             ),
           ],
@@ -886,6 +956,7 @@ class _MatchBox extends StatelessWidget {
   final Function(int, Map<String, dynamic>)? onEditPlayer;
   final Function(int)?                       onDeletePlayer;
   final Function(MatchPosition)?             onEditScore;
+  final Function(MatchPosition)?             onAssignTurn;
 
   const _MatchBox({
     required this.mp,
@@ -895,41 +966,138 @@ class _MatchBox extends StatelessWidget {
     this.onEditPlayer,
     this.onDeletePlayer,
     this.onEditScore,
+    this.onAssignTurn,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        color: kCardBg,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(
-          color: mp.isFinal
-              ? kYellow.withAlpha(89)
-              : Colors.white.withAlpha(18),
-          width: mp.isFinal ? 1.5 : 1,
+    // Leer turno asignado desde cualquiera de los dos slots
+    final matchSlot = slots[mp.slotP1]?['matchSlot'] as Map?
+        ?? slots[mp.slotP2]?['matchSlot'] as Map?;
+    final hasSlot    = matchSlot != null;
+    final slotDate   = hasSlot ? matchSlot['date']?.toString()     ?? '' : '';
+    final slotTime   = hasSlot ? matchSlot['time']?.toString()     ?? '' : '';
+    final slotEnd    = hasSlot ? matchSlot['endTime']?.toString()  ?? '' : '';
+    final slotCourt  = hasSlot ? matchSlot['courtName']?.toString() ?? '' : '';
+    final slotLabel  = slotEnd.isNotEmpty
+        ? '$slotDate · $slotTime–$slotEnd · $slotCourt'
+        : '$slotDate · $slotTime · $slotCourt';
+
+    // Hay resultado ya cargado
+    final hasResult = (slots[mp.slotP1]?['score'] as List?)?.isNotEmpty == true;
+
+    // Ambos jugadores presentes (no BYE, no vacío)
+    final n1 = (slots[mp.slotP1]?['name'] ?? '').toString();
+    final n2 = (slots[mp.slotP2]?['name'] ?? '').toString();
+    final bothPresent = n1.isNotEmpty && n2.isNotEmpty &&
+        n1 != 'BYE' && n2 != 'BYE';
+
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // Card principal del partido
+        Expanded(
+          child: Container(
+            decoration: BoxDecoration(
+              color: kCardBg,
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: mp.isFinal
+                    ? kYellow.withAlpha(89)
+                    : Colors.white.withAlpha(18),
+                width: mp.isFinal ? 1.5 : 1,
+              ),
+              boxShadow: mp.isFinal
+                  ? [BoxShadow(color: kYellow.withAlpha(15),
+                  blurRadius: 24, spreadRadius: 4)]
+                  : null,
+            ),
+            child: Column(children: [
+              Expanded(child: _PlayerRow(
+                data: slots[mp.slotP1], opponent: slots[mp.slotP2],
+                isP1: true, isTopRow: true,
+                slotIndex: mp.slotP1, mp: mp, isAdmin: isAdmin,
+                onAddPlayer: onAddPlayer, onEditPlayer: onEditPlayer,
+                onDeletePlayer: onDeletePlayer, onEditScore: onEditScore,
+              )),
+              Container(height: 1, color: Colors.white.withAlpha(13)),
+              Expanded(child: _PlayerRow(
+                data: slots[mp.slotP2], opponent: slots[mp.slotP1],
+                isP1: false, isTopRow: false,
+                slotIndex: mp.slotP2, mp: mp, isAdmin: isAdmin,
+                onAddPlayer: onAddPlayer, onEditPlayer: onEditPlayer,
+                onDeletePlayer: onDeletePlayer, onEditScore: onEditScore,
+              )),
+            ]),
+          ),
         ),
-        boxShadow: mp.isFinal
-            ? [BoxShadow(color: kYellow.withAlpha(15), blurRadius: 24, spreadRadius: 4)]
-            : null,
-      ),
-      child: Column(children: [
-        Expanded(child: _PlayerRow(
-          data: slots[mp.slotP1], opponent: slots[mp.slotP2],
-          isP1: true, isTopRow: true,
-          slotIndex: mp.slotP1, mp: mp, isAdmin: isAdmin,
-          onAddPlayer: onAddPlayer, onEditPlayer: onEditPlayer,
-          onDeletePlayer: onDeletePlayer, onEditScore: onEditScore,
-        )),
-        Container(height: 1, color: Colors.white.withAlpha(13)),
-        Expanded(child: _PlayerRow(
-          data: slots[mp.slotP2], opponent: slots[mp.slotP1],
-          isP1: false, isTopRow: false,
-          slotIndex: mp.slotP2, mp: mp, isAdmin: isAdmin,
-          onAddPlayer: onAddPlayer, onEditPlayer: onEditPlayer,
-          onDeletePlayer: onDeletePlayer, onEditScore: onEditScore,
-        )),
-      ]),
+
+        // ── TURNO ASIGNADO o BOTÓN ASIGNAR ──────────────────────────────────
+        if (bothPresent && !hasResult && isAdmin) ...[
+          const SizedBox(height: 4),
+          if (hasSlot)
+          // Mostrar turno ya asignado — tappable para cambiar
+            GestureDetector(
+              onTap: () => onAssignTurn?.call(mp),
+              child: Container(
+                width: kMatchW,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: kYellow.withAlpha(15),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: kYellow.withAlpha(50)),
+                ),
+                child: Row(children: [
+                  const Icon(Icons.schedule,
+                      color: kYellow, size: 10),
+                  const SizedBox(width: 4),
+                  Expanded(
+                    child: Text(
+                      slotLabel,
+                      style: const TextStyle(
+                          color: kYellow,
+                          fontSize: 8,
+                          fontWeight: FontWeight.bold),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const Icon(Icons.edit,
+                      color: kYellow, size: 8),
+                ]),
+              ),
+            )
+          else
+          // Botón para asignar turno
+            GestureDetector(
+              onTap: () => onAssignTurn?.call(mp),
+              child: Container(
+                width: kMatchW,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 8, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.white.withAlpha(5),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: Colors.white.withAlpha(20)),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.add_circle_outline,
+                        color: Colors.white24, size: 10),
+                    SizedBox(width: 4),
+                    Text('ASIGNAR TURNO',
+                        style: TextStyle(
+                            color: Colors.white24,
+                            fontSize: 8,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 1)),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ],
     );
   }
 }
@@ -1826,6 +1994,726 @@ class _ConfirmDialog extends StatelessWidget {
       ),
     );
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MODAL DE ASIGNACIÓN DE TURNO DE TORNEO — versión final
+// • Duración variable
+// • Disponibilidad en tiempo real (Stream)
+// • Luz nocturna correcta (ocaso configurable)
+// • Borra reservas anteriores con confirmación
+// ─────────────────────────────────────────────────────────────────────────────
+class _AssignTurnModal extends StatefulWidget {
+  final String                         clubId;
+  final String                         tournamentId;
+  final MatchPosition                  mp;
+  final Map<int, Map<String, dynamic>> slots;
+  final Function(String date, String time, String courtId, String courtName,
+      {String? endTime}) onAssigned;
+
+  const _AssignTurnModal({
+    required this.clubId,
+    required this.tournamentId,
+    required this.mp,
+    required this.slots,
+    required this.onAssigned,
+  });
+
+  @override
+  State<_AssignTurnModal> createState() => _AssignTurnModalState();
+}
+
+class _AssignTurnModalState extends State<_AssignTurnModal> {
+  DateTime _selectedDate     = DateTime.now();
+  String?  _selectedTime;
+  String?  _selectedCourtId;
+  String?  _selectedCourtName;
+  double   _durationHours    = 2.0;
+  bool     _isSaving         = false;
+
+  // Cache de reservas por cancha: courtId → Set<time>
+  final Map<String, Set<String>> _occupiedByCount = {};
+  // Streams activos por cancha
+  final Map<String, Stream<QuerySnapshot>> _courtStreams = {};
+  // Datos de canchas (nombre, hasLights)
+  List<QueryDocumentSnapshot> _courts = [];
+  bool _courtsLoaded = false;
+
+  // Turno anterior (si el partido ya tenía uno asignado)
+  Map<String, dynamic>? get _previousSlot =>
+      widget.slots[widget.mp.slotP1]?['matchSlot'] as Map<String, dynamic>?;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadCourts();
+  }
+
+  Future<void> _loadCourts() async {
+    final snap = await FirebaseFirestore.instance
+        .collection('clubs').doc(widget.clubId)
+        .collection('courts').get();
+    if (mounted) setState(() {
+      _courts      = snap.docs;
+      _courtsLoaded = true;
+    });
+  }
+
+  // Slots de hora inicio disponibles según duración
+  List<String> get _timeSlots {
+    final maxHour = 22 - _durationHours.ceil();
+    final result  = <String>[];
+    for (int min = 7 * 60; min <= maxHour * 60; min += 60) {
+      final h = min ~/ 60;
+      final m = min % 60;
+      result.add('${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}');
+    }
+    return result;
+  }
+
+  // Todos los slots que ocupa el bloque
+  List<String> _slotsForBlock(String startTime) {
+    final parts    = startTime.split(':');
+    final startMin = int.parse(parts[0]) * 60 + int.parse(parts[1]);
+    final totalMin = (_durationHours * 60).round();
+    final result   = <String>[];
+    for (int m = startMin; m < startMin + totalMin; m += 60) {
+      result.add('${(m ~/ 60).toString().padLeft(2,'0')}:${(m % 60).toString().padLeft(2,'0')}');
+    }
+    return result;
+  }
+
+  String _endTime(String startTime) {
+    final parts    = startTime.split(':');
+    final startMin = int.parse(parts[0]) * 60 + int.parse(parts[1]);
+    final endMin   = startMin + (_durationHours * 60).round();
+    return '${(endMin ~/ 60).toString().padLeft(2,'0')}:${(endMin % 60).toString().padLeft(2,'0')}';
+  }
+
+  // Verificar si un slot cae en horario nocturno (>= 20:00 aprox)
+  bool _isNightSlot(String time) {
+    final h = int.tryParse(time.split(':')[0]) ?? 0;
+    return h >= 20;
+  }
+
+  // Obtener stream de reservas de una cancha para la fecha seleccionada
+  Stream<QuerySnapshot> _streamForCourt(String courtId) {
+    final dateStr = DateFormat('yyyy-MM-dd').format(_selectedDate);
+    _courtStreams[courtId] ??= FirebaseFirestore.instance
+        .collection('clubs').doc(widget.clubId)
+        .collection('courts').doc(courtId)
+        .collection('reservations')
+        .where('date', isEqualTo: dateStr)
+        .snapshots();
+    return _courtStreams[courtId]!;
+  }
+
+  // Evaluar disponibilidad de una cancha dado un set de tiempos ocupados
+  String? _blockReason(QueryDocumentSnapshot courtDoc, Set<String> occupied) {
+    if (_selectedTime == null) return null;
+    final data      = courtDoc.data() as Map<String, dynamic>;
+    final hasLights = data['hasLights'] == true;
+    final needed    = _slotsForBlock(_selectedTime!);
+
+    // Chequear luz nocturna
+    if (!hasLights && needed.any(_isNightSlot)) {
+      return 'Sin luz nocturna';
+    }
+
+    // Chequear ocupación
+    final conflict = needed.where((s) => occupied.contains(s)).toList();
+    if (conflict.isNotEmpty) return 'Ocupada a las ${conflict.first}';
+
+    return null; // disponible
+  }
+
+  void _resetOnDateOrDurationChange() {
+    setState(() {
+      _selectedTime      = null;
+      _selectedCourtId   = null;
+      _selectedCourtName = null;
+      _courtStreams.clear();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final n1 = (widget.slots[widget.mp.slotP1]?['name'] ?? '').toString();
+    final n2 = (widget.slots[widget.mp.slotP2]?['name'] ?? '').toString();
+    final prev = _previousSlot;
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.all(20),
+      child: Container(
+        width: 420,
+        constraints: BoxConstraints(
+            maxHeight: MediaQuery.of(context).size.height * 0.92),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D1220),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: kYellow.withAlpha(51)),
+          boxShadow: [BoxShadow(color: Colors.black.withAlpha(179),
+              blurRadius: 40, spreadRadius: 8)],
+        ),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          _header(),
+          Flexible(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+
+                  // ── JUGADORES ─────────────────────────────────────────────
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withAlpha(8),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceAround,
+                      children: [
+                        Flexible(child: _playerChip(n1)),
+                        const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 8),
+                          child: Text('VS', style: TextStyle(
+                              color: Colors.white38, fontSize: 10,
+                              fontWeight: FontWeight.bold)),
+                        ),
+                        Flexible(child: _playerChip(n2)),
+                      ],
+                    ),
+                  ),
+
+                  // ── BANNER TURNO ANTERIOR ─────────────────────────────────
+                  if (prev != null) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.orangeAccent.withAlpha(20),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(
+                            color: Colors.orangeAccent.withAlpha(60)),
+                      ),
+                      child: Row(children: [
+                        const Icon(Icons.warning_amber_rounded,
+                            color: Colors.orangeAccent, size: 14),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Turno anterior: ${prev['courtName']} · '
+                                '${prev['date']} · ${prev['time']}',
+                            style: const TextStyle(
+                                color: Colors.orangeAccent, fontSize: 10),
+                          ),
+                        ),
+                      ]),
+                    ),
+                  ],
+                  const SizedBox(height: 20),
+
+                  // ── FECHA ─────────────────────────────────────────────────
+                  _sectionLabel('FECHA'),
+                  const SizedBox(height: 8),
+                  GestureDetector(
+                    onTap: () async {
+                      final picked = await showDatePicker(
+                        context: context,
+                        initialDate: _selectedDate,
+                        firstDate: DateTime.now(),
+                        lastDate: DateTime.now().add(const Duration(days: 60)),
+                        builder: (ctx, child) => Theme(
+                          data: ThemeData.dark().copyWith(
+                            colorScheme: const ColorScheme.dark(
+                                primary: kYellow, surface: Color(0xFF1A3A34)),
+                          ),
+                          child: child!,
+                        ),
+                      );
+                      if (picked != null) {
+                        setState(() => _selectedDate = picked);
+                        _resetOnDateOrDurationChange();
+                      }
+                    },
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withAlpha(8),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.white.withAlpha(26)),
+                      ),
+                      child: Row(children: [
+                        const Icon(Icons.calendar_today,
+                            color: kYellow, size: 16),
+                        const SizedBox(width: 10),
+                        Text(
+                          DateFormat("EEEE dd 'de' MMMM", 'es')
+                              .format(_selectedDate).toUpperCase(),
+                          style: const TextStyle(color: Colors.white,
+                              fontSize: 13, fontWeight: FontWeight.bold),
+                        ),
+                      ]),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+
+                  // ── DURACIÓN ──────────────────────────────────────────────
+                  _sectionLabel('DURACIÓN ESTIMADA'),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8, runSpacing: 8,
+                    children: [1.0, 1.5, 2.0, 2.5, 3.0].map((h) {
+                      final sel   = _durationHours == h;
+                      final isInt = h == h.truncateToDouble();
+                      final label = isInt ? '${h.toInt()}h' : '${h.toInt()}h 30m';
+                      return GestureDetector(
+                        onTap: () {
+                          setState(() => _durationHours = h);
+                          _resetOnDateOrDurationChange();
+                        },
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 150),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: sel ? kYellow.withAlpha(30)
+                                : Colors.white.withAlpha(8),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: sel ? kYellow : Colors.white.withAlpha(26),
+                              width: sel ? 1.5 : 1,
+                            ),
+                          ),
+                          child: Text(label, style: TextStyle(
+                            color: sel ? kYellow : Colors.white70,
+                            fontSize: 12,
+                            fontWeight: sel ? FontWeight.bold : FontWeight.normal,
+                          )),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+                  const SizedBox(height: 20),
+
+                  // ── HORA DE INICIO ────────────────────────────────────────
+                  _sectionLabel('HORA DE INICIO'),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8, runSpacing: 8,
+                    children: _timeSlots.map((time) {
+                      final sel = _selectedTime == time;
+                      return GestureDetector(
+                        onTap: () => setState(() {
+                          _selectedTime      = time;
+                          _selectedCourtId   = null;
+                          _selectedCourtName = null;
+                          _courtStreams.clear();
+                        }),
+                        child: AnimatedContainer(
+                          duration: const Duration(milliseconds: 150),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: sel ? kYellow.withAlpha(30)
+                                : Colors.white.withAlpha(8),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(
+                              color: sel ? kYellow : Colors.white.withAlpha(20),
+                              width: sel ? 1.5 : 1,
+                            ),
+                          ),
+                          child: Text(time, style: TextStyle(
+                            color: sel ? kYellow : Colors.white70,
+                            fontSize: 12,
+                            fontWeight: sel ? FontWeight.bold : FontWeight.normal,
+                          )),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+
+                  // ── CANCHAS EN TIEMPO REAL ────────────────────────────────
+                  if (_selectedTime != null && _courtsLoaded) ...[
+                    const SizedBox(height: 20),
+                    _sectionLabel('CANCHA DISPONIBLE'),
+                    const SizedBox(height: 8),
+                    Column(
+                      children: _courts.map((courtDoc) {
+                        final data      = courtDoc.data() as Map<String, dynamic>;
+                        final name      = data['courtName']?.toString() ?? courtDoc.id;
+                        final hasLights = data['hasLights'] == true;
+                        final isSelected = _selectedCourtId == courtDoc.id;
+
+                        return StreamBuilder<QuerySnapshot>(
+                          stream: _streamForCourt(courtDoc.id),
+                          builder: (ctx, snap) {
+                            final occupied = snap.hasData
+                                ? snap.data!.docs
+                                .map((d) => (d.data() as Map<String,dynamic>)['time']?.toString() ?? '')
+                                .toSet()
+                                : <String>{};
+
+                            final blockReason  = _blockReason(courtDoc, occupied);
+                            final isAvailable  = blockReason == null;
+
+                            return GestureDetector(
+                              onTap: isAvailable
+                                  ? () => setState(() {
+                                _selectedCourtId   = courtDoc.id;
+                                _selectedCourtName = name;
+                              })
+                                  : null,
+                              child: AnimatedContainer(
+                                duration: const Duration(milliseconds: 200),
+                                margin: const EdgeInsets.only(bottom: 8),
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 14, vertical: 12),
+                                decoration: BoxDecoration(
+                                  color: isSelected
+                                      ? kYellow.withAlpha(20)
+                                      : isAvailable
+                                      ? Colors.greenAccent.withAlpha(10)
+                                      : Colors.white.withAlpha(4),
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(
+                                    color: isSelected
+                                        ? kYellow
+                                        : isAvailable
+                                        ? Colors.greenAccent.withAlpha(80)
+                                        : Colors.white.withAlpha(12),
+                                    width: isSelected ? 1.5 : 1,
+                                  ),
+                                ),
+                                child: Row(children: [
+                                  Icon(
+                                    hasLights
+                                        ? Icons.lightbulb
+                                        : Icons.lightbulb_outline,
+                                    color: isSelected
+                                        ? kYellow
+                                        : isAvailable
+                                        ? Colors.greenAccent
+                                        : Colors.white24,
+                                    size: 14,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(name, style: TextStyle(
+                                      color: isSelected
+                                          ? kYellow
+                                          : isAvailable
+                                          ? Colors.white
+                                          : Colors.white24,
+                                      fontSize: 12,
+                                      fontWeight: isSelected
+                                          ? FontWeight.bold
+                                          : FontWeight.normal,
+                                    )),
+                                  ),
+                                  // Badge de estado
+                                  if (!snap.hasData)
+                                    const SizedBox(
+                                      width: 12, height: 12,
+                                      child: CircularProgressIndicator(
+                                          color: kYellow, strokeWidth: 1.5),
+                                    )
+                                  else if (isSelected)
+                                    const Icon(Icons.check_circle,
+                                        color: kYellow, size: 16)
+                                  else if (isAvailable)
+                                      _badge('LIBRE', Colors.greenAccent)
+                                    else
+                                      _badge(blockReason!, Colors.redAccent),
+                                ]),
+                              ),
+                            );
+                          },
+                        );
+                      }).toList(),
+                    ),
+                  ],
+
+                  // ── RESUMEN ───────────────────────────────────────────────
+                  if (_selectedTime != null && _selectedCourtId != null) ...[
+                    const SizedBox(height: 12),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: kYellow.withAlpha(10),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: kYellow.withAlpha(40)),
+                      ),
+                      child: Row(children: [
+                        const Icon(Icons.info_outline,
+                            color: kYellow, size: 14),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            '$_selectedCourtName · '
+                                '${_selectedTime!} – ${_endTime(_selectedTime!)} · '
+                                '${_slotsForBlock(_selectedTime!).length} slot(s)',
+                            style: const TextStyle(
+                                color: kYellow, fontSize: 10),
+                          ),
+                        ),
+                      ]),
+                    ),
+                  ],
+
+                  const SizedBox(height: 20),
+
+                  // ── BOTÓN CONFIRMAR ───────────────────────────────────────
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton(
+                      onPressed: (_selectedCourtId != null &&
+                          _selectedTime != null && !_isSaving)
+                          ? _tryConfirm
+                          : null,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: kYellow,
+                        disabledBackgroundColor: Colors.white.withAlpha(13),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8)),
+                        elevation: 0,
+                      ),
+                      child: _isSaving
+                          ? const SizedBox(width: 20, height: 20,
+                          child: CircularProgressIndicator(
+                              color: Colors.black, strokeWidth: 2))
+                          : Text(
+                        _selectedCourtId == null || _selectedTime == null
+                            ? 'ELEGÍ HORA Y CANCHA'
+                            : 'CONFIRMAR TURNO',
+                        style: TextStyle(
+                          color: _selectedCourtId != null &&
+                              _selectedTime != null
+                              ? Colors.black
+                              : Colors.white24,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                          letterSpacing: 1.5,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  // Intenta confirmar — si hay turno anterior, pide confirmación primero
+  Future<void> _tryConfirm() async {
+    final prev = _previousSlot;
+
+    if (prev != null) {
+      final prevCourt = prev['courtName'] ?? '';
+      final prevDate  = prev['date']      ?? '';
+      final prevTime  = prev['time']      ?? '';
+
+      final ok = await showDialog<bool>(
+        context: context,
+        builder: (_) => AlertDialog(
+          backgroundColor: const Color(0xFF0D1220),
+          shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+              side: BorderSide(color: Colors.orangeAccent.withAlpha(80))),
+          title: const Text('Cambiar turno asignado',
+              style: TextStyle(color: Colors.white,
+                  fontSize: 14, fontWeight: FontWeight.bold)),
+          content: Text(
+            'Se cancelará el turno anterior:\n'
+                '$prevCourt · $prevDate · $prevTime\n\n'
+                'Y se creará uno nuevo:\n'
+                '$_selectedCourtName · '
+                '${DateFormat('yyyy-MM-dd').format(_selectedDate)} · '
+                '$_selectedTime – ${_endTime(_selectedTime!)}',
+            style: const TextStyle(color: Colors.white70,
+                fontSize: 12, height: 1.5),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('CANCELAR',
+                  style: TextStyle(color: Colors.white38)),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: kYellow,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8))),
+              child: const Text('CONFIRMAR',
+                  style: TextStyle(color: Colors.black,
+                      fontWeight: FontWeight.bold)),
+            ),
+          ],
+        ),
+      );
+      if (ok != true) return;
+
+      // Borrar reservas anteriores
+      await _deletePreviousReservations(prev);
+    }
+
+    await _confirm();
+  }
+
+  // Borrar todas las reservas del turno anterior en Firestore
+  Future<void> _deletePreviousReservations(Map<String, dynamic> prev) async {
+    final prevCourtId = prev['courtId']?.toString() ?? '';
+    final prevDate    = prev['date']?.toString()    ?? '';
+    final prevTime    = prev['time']?.toString()    ?? '';
+    if (prevCourtId.isEmpty || prevDate.isEmpty) return;
+
+    // Buscar todas las reservas de ese partido en esa cancha/fecha
+    final snap = await FirebaseFirestore.instance
+        .collection('clubs').doc(widget.clubId)
+        .collection('courts').doc(prevCourtId)
+        .collection('reservations')
+        .where('date', isEqualTo: prevDate)
+        .where('tournamentId', isEqualTo: widget.tournamentId)
+        .get();
+
+    final batch = FirebaseFirestore.instance.batch();
+    for (final doc in snap.docs) {
+      // Solo borrar los del bloque anterior (blockStart coincide o time == prevTime)
+      final docData  = doc.data();
+      final docBlock = docData['blockStart']?.toString() ?? docData['time']?.toString() ?? '';
+      if (docBlock == prevTime) {
+        batch.delete(doc.reference);
+      }
+    }
+    await batch.commit();
+  }
+
+  Future<void> _confirm() async {
+    if (_selectedCourtId == null || _selectedTime == null) return;
+    setState(() => _isSaving = true);
+
+    final dateStr     = DateFormat('yyyy-MM-dd').format(_selectedDate);
+    final neededSlots = _slotsForBlock(_selectedTime!);
+    final endT        = _endTime(_selectedTime!);
+    final n1 = (widget.slots[widget.mp.slotP1]?['name'] ?? '').toString();
+    final n2 = (widget.slots[widget.mp.slotP2]?['name'] ?? '').toString();
+
+    // Re-validar disponibilidad antes de guardar
+    final resSnap = await FirebaseFirestore.instance
+        .collection('clubs').doc(widget.clubId)
+        .collection('courts').doc(_selectedCourtId)
+        .collection('reservations')
+        .where('date', isEqualTo: dateStr)
+        .get();
+
+    final occupied = resSnap.docs
+        .map((d) => d.data()['time']?.toString() ?? '')
+        .toSet();
+
+    final conflict = neededSlots.where((s) => occupied.contains(s)).toList();
+    if (conflict.isNotEmpty) {
+      if (mounted) {
+        setState(() => _isSaving = false);
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Conflicto: ${conflict.first} ya está ocupado en $_selectedCourtName'),
+          backgroundColor: Colors.redAccent,
+        ));
+      }
+      return;
+    }
+
+    // Crear reservas en batch (una por slot)
+    final batch = FirebaseFirestore.instance.batch();
+    for (final slotTime in neededSlots) {
+      final ref = FirebaseFirestore.instance
+          .collection('clubs').doc(widget.clubId)
+          .collection('courts').doc(_selectedCourtId)
+          .collection('reservations').doc();
+      batch.set(ref, {
+        'date':         dateStr,
+        'time':         slotTime,
+        'type':         'torneo',
+        'modality':     'singles',
+        'playerName':   '$n1 vs $n2',
+        'phone':        '',
+        'tournamentId': widget.tournamentId,
+        'blockStart':   _selectedTime,
+        'blockEnd':     endT,
+        'amount':       0,
+        'status':       'confirmed',
+        'createdAt':    FieldValue.serverTimestamp(),
+      });
+    }
+    await batch.commit();
+
+    if (mounted) {
+      Navigator.pop(context);
+      widget.onAssigned(
+        dateStr, _selectedTime!, _selectedCourtId!, _selectedCourtName!,
+        endTime: endT,
+      );
+    }
+  }
+
+  Widget _badge(String label, Color color) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+    decoration: BoxDecoration(
+      color: color.withAlpha(20),
+      borderRadius: BorderRadius.circular(6),
+      border: Border.all(color: color.withAlpha(60)),
+    ),
+    child: Text(label, style: TextStyle(
+        color: color, fontSize: 9, fontWeight: FontWeight.bold)),
+  );
+
+  Widget _header() => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+    decoration: BoxDecoration(
+        border: Border(bottom: BorderSide(
+            color: Colors.white.withAlpha(18)))),
+    child: Row(children: [
+      Container(
+        padding: const EdgeInsets.all(6),
+        decoration: BoxDecoration(
+            color: kYellow.withAlpha(26),
+            borderRadius: BorderRadius.circular(6)),
+        child: const Icon(Icons.schedule, color: kYellow, size: 14),
+      ),
+      const SizedBox(width: 10),
+      const Text('ASIGNAR TURNO',
+          style: TextStyle(color: Colors.white, fontSize: 12,
+              fontWeight: FontWeight.bold, letterSpacing: 2)),
+      const Spacer(),
+      GestureDetector(
+        onTap: () => Navigator.pop(context),
+        child: Container(
+          padding: const EdgeInsets.all(4),
+          decoration: BoxDecoration(
+              color: Colors.white.withAlpha(13),
+              borderRadius: BorderRadius.circular(4)),
+          child: const Icon(Icons.close, color: Colors.white38, size: 14),
+        ),
+      ),
+    ]),
+  );
+
+  Widget _sectionLabel(String label) => Text(label,
+      style: TextStyle(color: Colors.white.withAlpha(77),
+          fontSize: 8, fontWeight: FontWeight.bold, letterSpacing: 1.5));
+
+  Widget _playerChip(String name) => Text(name.toUpperCase(),
+      style: const TextStyle(color: Colors.white,
+          fontSize: 11, fontWeight: FontWeight.bold),
+      overflow: TextOverflow.ellipsis);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

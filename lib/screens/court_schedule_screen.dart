@@ -450,10 +450,10 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
               ]),
             ]),
 
-          // WhatsApp si tiene teléfono
-          if (occupied && res['phone'] != null && res['phone'].toString().isNotEmpty)
+          // WhatsApp si tiene teléfono (null-safe para reservas de torneo que no tienen phone)
+          if (occupied && _resPhone(res) != null && _resPhone(res)!.isNotEmpty)
             GestureDetector(
-              onTap: () => _launchWA(res['phone'], res['playerName'] ?? '', time),
+              onTap: () => _launchWA(_resPhone(res)!, res['playerName'] ?? '', time),
               child: const Padding(
                 padding: EdgeInsets.only(left: 8),
                 child: Icon(Icons.chat, color: Colors.greenAccent, size: 18),
@@ -472,6 +472,15 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
         ]),
       ),
     );
+  }
+
+  // Helper null-safe para leer 'phone' de una reserva (puede no existir en torneos)
+  String? _resPhone(QueryDocumentSnapshot? res) {
+    if (res == null) return null;
+    final data = res.data() as Map<String, dynamic>?;
+    return data?.containsKey('phone') == true
+        ? (data!['phone']?.toString() ?? '').isEmpty ? null : data['phone'].toString()
+        : null;
   }
 
   Widget _buildSlotLabel(String time, QueryDocumentSnapshot? res, bool blocked) {
@@ -832,7 +841,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
                       side: const BorderSide(color: Colors.white12),
                       onPressed: () => setModal(() {
                         nameC.text  = data['name']  ?? '';
-                        phoneC.text = data['phone'] ?? '';
+                        phoneC.text = (data.containsKey('phone') ? data['phone']?.toString() : null) ?? '';
                       }),
                     ),
                   );
@@ -848,7 +857,8 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
 
   // ── DETALLES DE RESERVA EXISTENTE ─────────────────────────────────────────
   void _showReservationDetails(QueryDocumentSnapshot res) {
-    final data = res.data() as Map<String, dynamic>;
+    final data    = res.data() as Map<String, dynamic>;
+    final resPhone = data.containsKey('phone') ? (data['phone']?.toString() ?? '') : '';
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
@@ -877,9 +887,9 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
               data['playerName'] ?? 'Sin nombre',
               style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
             ),
-            if (data['phone'] != null && data['phone'].toString().isNotEmpty) ...[
+            if (resPhone.isNotEmpty) ...[
               const SizedBox(height: 4),
-              Text(data['phone'], style: const TextStyle(color: Colors.white54, fontSize: 14)),
+              Text(resPhone, style: const TextStyle(color: Colors.white54, fontSize: 14)),
             ],
             const SizedBox(height: 12),
             Row(children: [
@@ -888,7 +898,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
               _detailChip(_formatPrice((data['amount'] ?? 0).toDouble()), Icons.attach_money),
             ]),
             const SizedBox(height: 20),
-            if (data['phone'] != null && data['phone'].toString().isNotEmpty)
+            if (resPhone.isNotEmpty)
               SizedBox(
                 width: double.infinity,
                 child: ElevatedButton.icon(
@@ -903,7 +913,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
                   ),
                   onPressed: () {
                     Navigator.pop(context);
-                    _launchWA(data['phone'], data['playerName'] ?? '', data['time']);
+                    _launchWA(resPhone, data['playerName'] ?? '', data['time'] ?? '');
                   },
                 ),
               ),
