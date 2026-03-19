@@ -7,6 +7,9 @@ import 'package:flutter/services.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:image_cropper/image_cropper.dart'; // Importación añadida
 
+// ignore: depend_on_referenced_packages
+import 'global_statistics_screen.dart' show NotificationService;
+
 class TournamentManualConfigScreen extends StatefulWidget {
   final String clubId;
   const TournamentManualConfigScreen({super.key, required this.clubId});
@@ -110,6 +113,14 @@ class _TournamentManualConfigScreenState extends State<TournamentManualConfigScr
         'status': 'setup',
         'isManualSyncFinished': false,
       });
+
+      // Novedad: torneo creado
+      await NotificationService.write(
+        clubId:  widget.clubId,
+        type:    'tournament',
+        message: '🏆 Nuevo torneo creado: ${_nameController.text.toUpperCase()}',
+        extra:   {'tournamentId': tournamentId},
+      );
 
       if (mounted) Navigator.pop(context);
     } catch (e) {

@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/weather_service.dart';
+import 'pricing_config_screen.dart' show ClubPricing;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODELO DE CONFIGURACIÓN DE PRECIOS DE CANCHA
@@ -23,14 +24,13 @@ class CourtPricing {
   final double priceNightSingles;
   final double priceDayDobles;
   final double priceNightDobles;
-  final int    slotMinutes;
+  static const int slotMinutes = 30; // fijo 30 min
 
   const CourtPricing({
     this.priceDaySingles   = 5000,
     this.priceNightSingles = 8000,
     this.priceDayDobles    = 7000,
     this.priceNightDobles  = 10000,
-    this.slotMinutes       = 60,
   });
 
   factory CourtPricing.fromMap(Map<String, dynamic>? m) {
@@ -40,7 +40,6 @@ class CourtPricing {
       priceNightSingles: (m['priceNightSingles'] ?? m['priceNightSlot'] ?? 8000).toDouble(),
       priceDayDobles:    (m['priceDayDobles']    ?? 7000).toDouble(),
       priceNightDobles:  (m['priceNightDobles']  ?? 10000).toDouble(),
-      slotMinutes:        m['slotMinutes']        ?? 60,
     );
   }
 
@@ -49,7 +48,6 @@ class CourtPricing {
     'priceNightSingles': priceNightSingles,
     'priceDayDobles':    priceDayDobles,
     'priceNightDobles':  priceNightDobles,
-    'slotMinutes':       slotMinutes,
   };
 
   double priceFor({required bool isNight, required CourtModality modality}) {
@@ -113,15 +111,17 @@ extension ReservationTypeExt on ReservationType {
 // SCREEN
 // ─────────────────────────────────────────────────────────────────────────────
 class CourtScheduleScreen extends StatefulWidget {
-  final String clubId;
-  final String courtId;
-  final String courtName;
+  final String   clubId;
+  final String   courtId;
+  final String   courtName;
+  final DateTime? initialDate;
 
   const CourtScheduleScreen({
     super.key,
     required this.clubId,
     required this.courtId,
     required this.courtName,
+    this.initialDate,
   });
 
   @override
@@ -144,6 +144,9 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
   @override
   void initState() {
     super.initState();
+    if (widget.initialDate != null) {
+      _selectedDate = widget.initialDate!;
+    }
     _loadInitialData();
   }
 
@@ -156,17 +159,31 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
       if (mounted) setState(() => _userRole = userDoc.data()?['role'] ?? 'player');
     }
 
-    // Datos de la cancha (luz + precios)
+    // Datos de la cancha (solo luz — precios vienen del club)
     final courtDoc = await FirebaseFirestore.instance
         .collection('clubs').doc(widget.clubId)
         .collection('courts').doc(widget.courtId)
         .get();
 
     if (mounted && courtDoc.exists) {
+      setState(() => _hasLights = courtDoc.data()?['hasLights'] ?? true);
+    }
+
+    // Tarifas vigentes del club
+    final pricingDoc = await FirebaseFirestore.instance
+        .collection('clubs').doc(widget.clubId)
+        .collection('pricing').doc('current')
+        .get();
+
+    if (mounted && pricingDoc.exists) {
+      final p = ClubPricing.fromMap(pricingDoc.data());
       setState(() {
-        _hasLights = courtDoc.data()?['hasLights'] ?? true;
-        _pricing   = CourtPricing.fromMap(
-            courtDoc.data()?['pricing'] as Map<String, dynamic>?);
+        _pricing = CourtPricing(
+          priceDaySingles:   p.singlesDay,
+          priceNightSingles: p.singlesNight,
+          priceDayDobles:    p.doblesDay,
+          priceNightDobles:  p.doblesNight,
+        );
       });
     }
 
@@ -190,7 +207,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
   // ── SLOTS ─────────────────────────────────────────────────────────────────
   List<String> _generateSlots() {
     final slots = <String>[];
-    final step  = _pricing.slotMinutes;
+    const step  = CourtPricing.slotMinutes;
     for (int totalMin = 7 * 60; totalMin <= 22 * 60; totalMin += step) {
       final h = totalMin ~/ 60;
       final m = totalMin % 60;
@@ -239,12 +256,6 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
         actions: [
-          if (_isAdmin)
-            IconButton(
-              icon: const Icon(Icons.settings, color: Colors.white54, size: 20),
-              tooltip: 'Configurar precios',
-              onPressed: _showPricingConfig,
-            ),
           if (_isAdmin && _selectedSlots.isNotEmpty)
             IconButton(
               icon: const Icon(Icons.check_circle, color: Color(0xFFCCFF00)),
@@ -256,10 +267,10 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
       body: _isLoading
           ? const Center(child: CircularProgressIndicator(color: Color(0xFFCCFF00)))
           : Column(children: [
-        _buildDatePicker(),
-        _buildHeader(),
-        Expanded(child: _buildSlotList(slots)),
-      ]),
+              _buildDatePicker(),
+              _buildHeader(),
+              Expanded(child: _buildSlotList(slots)),
+            ]),
     );
   }
 
@@ -308,7 +319,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
             ),
           const Spacer(),
           _chip(
-            '${_pricing.slotMinutes} MIN',
+            '30 MIN',
             Colors.white38,
             Icons.timer_outlined,
           ),
@@ -389,12 +400,12 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
       onTap: blocked ? null : () => _handleTap(time, res),
       onLongPress: (_isAdmin && !occupied && !blocked)
           ? () => setState(() {
-        if (_selectedSlots.contains(time)) {
-          _selectedSlots.remove(time);
-        } else {
-          _selectedSlots.add(time);
-        }
-      })
+                if (_selectedSlots.contains(time)) {
+                  _selectedSlots.remove(time);
+                } else {
+                  _selectedSlots.add(time);
+                }
+              })
           : null,
       child: Container(
         margin: const EdgeInsets.only(bottom: 6),
@@ -406,8 +417,8 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
             color: selected
                 ? const Color(0xFFCCFF00)
                 : blocked
-                ? Colors.white.withOpacity(0.05)
-                : Colors.white.withOpacity(0.08),
+                    ? Colors.white.withOpacity(0.05)
+                    : Colors.white.withOpacity(0.08),
             width: selected ? 1.5 : 1,
           ),
         ),
@@ -738,28 +749,28 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
                     onPressed: selectedType == null
                         ? null
                         : () async {
-                      Navigator.pop(ctx);
-                      for (final t in times) {
-                        await _createReservation(
-                          time:       t,
-                          type:       selectedType!,
-                          modality:   modality,
-                          playerName: nameCtrl.text.trim(),
-                          phone:      phoneCtrl.text.trim(),
-                        );
-                      }
-                      if (nameCtrl.text.trim().isNotEmpty) {
-                        _saveRecentContact(
-                            nameCtrl.text.trim(), phoneCtrl.text.trim());
-                      }
-                      setState(() => _selectedSlots.clear());
-                      if (phoneCtrl.text.trim().isNotEmpty &&
-                          (selectedType == ReservationType.whatsapp ||
-                              selectedType == ReservationType.alquiler)) {
-                        _offerWhatsApp(phoneCtrl.text.trim(),
-                            nameCtrl.text.trim(), times);
-                      }
-                    },
+                            Navigator.pop(ctx);
+                            for (final t in times) {
+                              await _createReservation(
+                                time:       t,
+                                type:       selectedType!,
+                                modality:   modality,
+                                playerName: nameCtrl.text.trim(),
+                                phone:      phoneCtrl.text.trim(),
+                              );
+                            }
+                            if (nameCtrl.text.trim().isNotEmpty) {
+                              _saveRecentContact(
+                                  nameCtrl.text.trim(), phoneCtrl.text.trim());
+                            }
+                            setState(() => _selectedSlots.clear());
+                            if (phoneCtrl.text.trim().isNotEmpty &&
+                                (selectedType == ReservationType.whatsapp ||
+                                 selectedType == ReservationType.alquiler)) {
+                              _offerWhatsApp(phoneCtrl.text.trim(),
+                                  nameCtrl.text.trim(), times);
+                            }
+                          },
                     style: ElevatedButton.styleFrom(
                       backgroundColor: const Color(0xFFCCFF00),
                       disabledBackgroundColor: Colors.white10,
@@ -977,7 +988,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
         text: _pricing.priceDayDobles.toInt().toString());
     final nightDCtrl = TextEditingController(
         text: _pricing.priceNightDobles.toInt().toString());
-    int slotMin = _pricing.slotMinutes;
+    int slotMin = CourtPricing.slotMinutes;
 
     showModalBottomSheet(
       context: context,
@@ -1098,7 +1109,6 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
                         priceNightSingles: double.tryParse(nightSCtrl.text) ?? _pricing.priceNightSingles,
                         priceDayDobles:    double.tryParse(dayDCtrl.text)   ?? _pricing.priceDayDobles,
                         priceNightDobles:  double.tryParse(nightDCtrl.text) ?? _pricing.priceNightDobles,
-                        slotMinutes:       slotMin,
                       );
                       await FirebaseFirestore.instance
                           .collection('clubs').doc(widget.clubId)
@@ -1139,8 +1149,27 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
     String? playerName,
     String? phone,
   }) async {
-    final dateStr = DateFormat('yyyy-MM-dd').format(_selectedDate);
-    final price   = _priceFor(time, modality: modality);
+    final dateStr  = DateFormat('yyyy-MM-dd').format(_selectedDate);
+    final isNight  = _isAfterSunset(time) && _hasLights;
+    final isDobles = modality == CourtModality.dobles;
+
+    // Leer precio desde tarifas del club
+    double price = 0;
+    try {
+      final pricingDoc = await FirebaseFirestore.instance
+          .collection('clubs').doc(widget.clubId)
+          .collection('pricing').doc('current').get();
+      final p = ClubPricing.fromMap(pricingDoc.data());
+      price = p.priceFor(
+        type:     type.firestoreKey,
+        isNight:  isNight,
+        isDobles: isDobles,
+      );
+    } catch (_) {
+      // Fallback al precio local si falla
+      price = _priceFor(time, modality: modality);
+    }
+
     await FirebaseFirestore.instance
         .collection('clubs').doc(widget.clubId)
         .collection('courts').doc(widget.courtId)
@@ -1149,7 +1178,7 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
       'date':        dateStr,
       'time':        time,
       'type':        type.firestoreKey,
-      'modality':    modality.name,   // 'singles' o 'dobles'
+      'modality':    modality.name,
       'playerName':  playerName ?? '',
       'phone':       phone ?? '',
       'amount':      price,
@@ -1157,6 +1186,29 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
       'status':      'confirmed',
       'createdAt':   FieldValue.serverTimestamp(),
     });
+
+    // Novedad automática (solo para reservas con nombre)
+    if (playerName != null && playerName.isNotEmpty) {
+      final now     = DateTime.now();
+      final dateNow = DateFormat('yyyy-MM-dd').format(now);
+      final timeNow = DateFormat('HH:mm').format(now);
+      final emoji   = type == ReservationType.alquiler        ? '🎾'
+                    : type == ReservationType.claseIndividual ? '📚'
+                    : type == ReservationType.claseGrupal     ? '👥'
+                    : '📲';
+      try {
+        await FirebaseFirestore.instance
+            .collection('clubs').doc(widget.clubId)
+            .collection('notifications').add({
+          'type':      'reservation',
+          'message':   '$emoji ${type.label}: $playerName · ${widget.courtName} · $dateStr $time',
+          'date':      dateNow,
+          'time':      timeNow,
+          'sortKey':   DateFormat('yyyyMMddHHmm').format(DateTime.now()),
+        'createdAt': FieldValue.serverTimestamp(),
+        });
+      } catch (_) {}
+    }
   }
 
   Future<void> _saveRecentContact(String name, String phone) async {
@@ -1173,27 +1225,111 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
   }
 
   void _confirmDelete(QueryDocumentSnapshot res) {
+    final data = res.data() as Map<String, dynamic>;
+    final type = data['type']?.toString() ?? '';
+    final isTorneo = type == 'torneo';
+
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF2C4A44),
-        title: const Text('Cancelar reserva', style: TextStyle(color: Colors.white)),
-        content: const Text('¿Confirmás que querés eliminar esta reserva?',
-            style: TextStyle(color: Colors.white70)),
+        title: const Text('Cancelar reserva',
+            style: TextStyle(color: Colors.white)),
+        content: Text(
+          isTorneo
+              ? '¿Cancelar el turno de este partido de torneo? Se liberarán todos los slots del bloque.'
+              : '¿Confirmás que querés eliminar esta reserva?',
+          style: const TextStyle(color: Colors.white70)),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(context),
-              child: const Text('NO', style: TextStyle(color: Colors.white54))),
+              child: const Text('NO',
+                  style: TextStyle(color: Colors.white54))),
           TextButton(
-              onPressed: () {
+              onPressed: () async {
                 Navigator.pop(context);
-                res.reference.delete();
+                if (isTorneo) {
+                  await _deleteTorneoBlock(res);
+                } else {
+                  await res.reference.delete();
+                }
               },
               child: const Text('SÍ, CANCELAR',
-                  style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold))),
+                  style: TextStyle(
+                      color: Colors.redAccent,
+                      fontWeight: FontWeight.bold))),
         ],
       ),
     );
+  }
+
+  Future<void> _deleteTorneoBlock(QueryDocumentSnapshot res) async {
+    final data       = res.data() as Map<String, dynamic>;
+    final tournamentId = data['tournamentId']?.toString() ?? '';
+    final blockStart = data['blockStart']?.toString() ?? data['time']?.toString() ?? '';
+    final dateStr    = data['date']?.toString() ?? '';
+
+    // 1. Borrar todos los slots del bloque en la cancha
+    final snap = await FirebaseFirestore.instance
+        .collection('clubs').doc(widget.clubId)
+        .collection('courts').doc(widget.courtId)
+        .collection('reservations')
+        .where('date', isEqualTo: dateStr)
+        .where('tournamentId', isEqualTo: tournamentId)
+        .get();
+
+    final batch = FirebaseFirestore.instance.batch();
+    for (final doc in snap.docs) {
+      final docData  = doc.data() as Map<String, dynamic>;
+      final docBlock = docData['blockStart']?.toString() ?? docData['time']?.toString() ?? '';
+      // Solo borrar los del mismo bloque
+      if (docBlock == blockStart || docData['blockStart'] == null) {
+        batch.delete(doc.reference);
+      }
+    }
+    await batch.commit();
+
+    // 2. Limpiar el matchSlot en el bracket del torneo
+    if (tournamentId.isNotEmpty) {
+      try {
+        final layoutRef = FirebaseFirestore.instance
+            .collection('tournaments').doc(tournamentId)
+            .collection('temp_layout').doc('current');
+
+        final layoutSnap = await layoutRef.get();
+        if (layoutSnap.exists) {
+          final raw = layoutSnap.data()?['slots'] as Map?;
+          if (raw != null) {
+            final playerName = data['playerName']?.toString() ?? '';
+            final updatedSlots = Map<String, dynamic>.from(raw);
+            bool changed = false;
+
+            for (final key in updatedSlots.keys) {
+              final slot = Map<String, dynamic>.from(
+                  updatedSlots[key] as Map);
+              final slotName = slot['name']?.toString() ?? '';
+
+              // Limpiar matchSlot de los dos jugadores del partido
+              if (playerName.contains(' vs ')) {
+                final parts = playerName.split(' vs ');
+                if (slotName == parts[0].trim() ||
+                    slotName == parts[1].trim()) {
+                  slot.remove('matchSlot');
+                  updatedSlots[key] = slot;
+                  changed = true;
+                }
+              }
+            }
+
+            if (changed) {
+              await layoutRef.update({'slots': updatedSlots});
+            }
+          }
+        }
+      } catch (e) {
+        debugPrint('Error limpiando matchSlot: $e');
+      }
+    }
   }
 
   void _offerWhatsApp(String phone, String name, List<String> times) {

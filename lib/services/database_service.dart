@@ -8,6 +8,25 @@ import '../models/tournament_model.dart';
 
 class DatabaseService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
+
+  // Helper para escribir novedades en el club
+  Future<void> _notify(String clubId, String type, String message,
+      [Map<String, dynamic> extra = const {}]) async {
+    if (clubId.isEmpty) return;
+    final now = DateTime.now();
+    try {
+      await _db.collection('clubs').doc(clubId)
+          .collection('notifications').add({
+        'type':      type,
+        'message':   message,
+        'date':      '${now.year}-${now.month.toString().padLeft(2,'0')}-${now.day.toString().padLeft(2,'0')}',
+        'time':      '${now.hour.toString().padLeft(2,'0')}:${now.minute.toString().padLeft(2,'0')}',
+        'sortKey':   '${now.year}${now.month.toString().padLeft(2,'0')}${now.day.toString().padLeft(2,'0')}${now.hour.toString().padLeft(2,'0')}${now.minute.toString().padLeft(2,'0')}',
+        'createdAt': FieldValue.serverTimestamp(),
+        ...extra,
+      });
+    } catch (_) {}
+  }
   
   final String usersCollection = 'users'; 
   final String clubsCollection = 'clubs';
@@ -52,6 +71,9 @@ class DatabaseService {
       });
     }
     await batch.commit();
+    // Novedad: jugadores cargados al torneo
+    await _notify(clubId, 'player_join',
+        '👥 Se cargaron ${players.length} jugador(es) al torneo');
   }
 
   Future<void> createManualFixture(String requestorUid, String tournamentId, String p1Id, String p2Id, String round) async {
@@ -137,10 +159,17 @@ class DatabaseService {
   }
 
   // --- ADMIN METHODS ---
-  Future<void> assignCoins(String uid, int amount) async {
+  Future<void> assignCoins(String uid, int amount, {String? clubId}) async {
     await _db.collection(usersCollection).doc(uid).update({
       'balance_coins': FieldValue.increment(amount),
     });
+    // Novedad: asignación de coins
+    if (clubId != null && clubId.isNotEmpty) {
+      final userDoc = await _db.collection(usersCollection).doc(uid).get();
+      final name = userDoc.data()?['displayName'] ?? 'Jugador';
+      await _notify(clubId, 'coins',
+          '💰 Se asignaron $amount coins a $name');
+    }
   }
 
   Future<void> createMockUsers(int count) async {

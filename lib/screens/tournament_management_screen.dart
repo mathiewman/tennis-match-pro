@@ -249,7 +249,10 @@ class _TournamentManagementScreenState
   late final BracketLayout _layout;
   RankingConfig _rankingConfig = const RankingConfig();
   String? _lastRecalculatedTournamentId;
-  bool _isRankingConfigLoaded = false; // ADDED: Flag to track ranking config loading
+  bool _isRankingConfigLoaded = false;
+
+  // Plazos por ronda: round index → fecha límite
+  Map<int, DateTime> _roundDeadlines = {};
 
   @override
   void initState() {
@@ -257,6 +260,7 @@ class _TournamentManagementScreenState
     _layout = BracketLayout(_nearestValidCount(widget.playerCount));
     _loadUserRole();
     _loadRankingConfig();
+    _loadRoundDeadlines();
   }
 
   int _nearestValidCount(int n) {
@@ -294,6 +298,113 @@ class _TournamentManagementScreenState
     }
   }
 
+  Future<void> _loadRoundDeadlines() async {
+    final doc = await FirebaseFirestore.instance
+        .collection('tournaments')
+        .doc(widget.tournamentId)
+        .get();
+    final raw = doc.data()?['roundDeadlines'];
+    if (raw is Map && mounted) {
+      setState(() {
+        _roundDeadlines = raw.map((k, v) =>
+          MapEntry(int.tryParse(k.toString()) ?? 0,
+            DateTime.tryParse(v.toString()) ?? DateTime.now()));
+      });
+    }
+  }
+
+  Future<void> _saveRoundDeadlines() async {
+    await FirebaseFirestore.instance
+        .collection('tournaments')
+        .doc(widget.tournamentId)
+        .update({
+      'roundDeadlines': _roundDeadlines.map(
+          (k, v) => MapEntry(k.toString(), v.toIso8601String())),
+    });
+  }
+
+  void _showDeadlineModal(int round) async {
+    final label   = _roundLabel(round);
+    final current = _roundDeadlines[round] ?? DateTime.now().add(const Duration(days: 7));
+
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: current,
+      firstDate: DateTime.now().subtract(const Duration(days: 1)),
+      lastDate: DateTime.now().add(const Duration(days: 365)),
+      helpText: 'Plazo para $label',
+      builder: (ctx, child) => Theme(
+        data: ThemeData.dark().copyWith(
+          colorScheme: const ColorScheme.dark(
+            primary: kYellow, surface: Color(0xFF1A3A34)),
+        ),
+        child: child!,
+      ),
+    );
+
+    if (picked != null && mounted) {
+      setState(() => _roundDeadlines[round] = picked);
+      await _saveRoundDeadlines();
+    }
+  }
+
+  // Notificar por WA a jugadores con partidos vencidos en una ronda
+  Future<void> _notifyOverdueRound(
+      int round, Map<int, Map<String, dynamic>> slots) async {
+    int sent = 0;
+    for (final mp in _layout.matches.where((m) => m.round == round)) {
+      final s1 = slots[mp.slotP1];
+      final s2 = slots[mp.slotP2];
+      if (s1 == null || s2 == null) continue;
+      final hasResult = (s1['score'] as List?)?.isNotEmpty == true;
+      if (hasResult) continue;
+
+      final n1     = s1['name']?.toString()  ?? '';
+      final n2     = s2['name']?.toString()  ?? '';
+      final phone1 = s1['phone']?.toString() ?? '';
+      final phone2 = s2['phone']?.toString() ?? '';
+      final dl     = _roundDeadlines[round];
+      final dlStr  = dl != null ? DateFormat('dd/MM').format(dl) : 'ya';
+
+      final msg = 'Hola! Tu partido de torneo contra {rival} '
+          'debía jugarse antes del $dlStr. Por favor coordiná con tu rival. 🎾';
+
+      Future<void> sendWA(String phone, String rival) async {
+        if (phone.isEmpty) return;
+        final clean = phone.replaceAll(RegExp(r'[^\d]'), '');
+        final url   = Uri.parse(
+            'https://wa.me/549$clean?text=${Uri.encodeComponent(msg.replaceAll('{rival}', rival))}');
+        if (await canLaunchUrl(url)) {
+          await launchUrl(url, mode: LaunchMode.externalApplication);
+          sent++;
+        }
+      }
+
+      if (n1.isNotEmpty && n2.isNotEmpty) {
+        await sendWA(phone1, n2);
+        await sendWA(phone2, n1);
+      }
+    }
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text(sent > 0
+            ? 'WhatsApp enviado a $sent jugador(es)'
+            : 'No hay teléfonos cargados para notificar'),
+        backgroundColor: sent > 0 ? Colors.greenAccent : Colors.orangeAccent,
+      ));
+    }
+  }
+
+  String _roundLabel(int r) {
+    final diff = _layout.totalRounds - 1 - r;
+    if (diff == 0) return 'GRAN FINAL';
+    if (diff == 1) return 'SEMIFINAL';
+    if (diff == 2) return 'CUARTOS';
+    if (diff == 3) return 'OCTAVOS';
+    return 'RONDA ${r + 1}';
+  }
+
   bool get _isAdmin => _userRole == 'admin' || _userRole == 'coordinator';
 
   DocumentReference get _layoutDoc => FirebaseFirestore.instance
@@ -312,9 +423,9 @@ class _TournamentManagementScreenState
       int p1, int p2, int nextSlot,
       List<String> score, int winnerSlot,
       Map<int, Map<String, dynamic>> slots, {
-        String? specialResult,
-        int? woAbsentSlot,    // slot del ausente en W.O.
-        int? abandonSlot,     // slot del que abandonó
+      String? specialResult,
+      int? woAbsentSlot,    // slot del ausente en W.O.
+      int? abandonSlot,     // slot del que abandonó
       }) {
     final updated  = Map<int, Map<String, dynamic>>.from(slots);
     final loserSlot = winnerSlot == p1 ? p2 : p1;
@@ -352,10 +463,36 @@ class _TournamentManagementScreenState
         'hadBye':        w['isBye'] == true || w['hadBye'] == true,
       };
     }
-    _persist(updated).then((_) => _triggerStatsRecalc(updated));
+    _persist(updated).then((_) async {
+      _triggerStatsRecalc(updated);
+      // Novedad automática
+      final n1w = updated[winnerSlot]?['name'] ?? '';
+      final nLose = updated[loserSlot]?['name'] ?? '';
+      String msg;
+      String type;
+      if (specialResult == 'walkover') {
+        msg  = '🎾 W.O. — $n1w avanzó, $nLose no se presentó';
+        type = 'wo';
+      } else if (specialResult == 'abandono') {
+        msg  = '🚩 Abandono — $nLose abandonó vs $n1w';
+        type = 'abandono';
+      } else {
+        msg  = '🎾 Resultado cargado: $n1w venció a $nLose';
+        type = 'tournament';
+      }
+      await FirebaseFirestore.instance
+          .collection('clubs').doc(widget.clubId)
+          .collection('notifications').add({
+        'type':         type,
+        'message':      msg,
+        'date':         DateFormat('yyyy-MM-dd').format(DateTime.now()),
+        'time':         DateFormat('HH:mm').format(DateTime.now()),
+        'sortKey':      DateFormat('yyyyMMddHHmm').format(DateTime.now()),
+        'tournamentId': widget.tournamentId,
+        'createdAt':    FieldValue.serverTimestamp(),
+      });
+    });
   }
-
-  // ── ASIGNAR BYE ───────────────────────────────────────────────────────────
   /// Marca un slot vacío como BYE — el jugador del slot opuesto avanza automáticamente.
   void _assignBye(int emptySlot, Map<int, Map<String, dynamic>> slots) {
     final mp = _layout.matchForSlot(emptySlot);
@@ -493,9 +630,9 @@ class _TournamentManagementScreenState
         canBye:  canBye,
         onBye:   canBye
             ? () {
-          Navigator.pop(context);
-          _assignBye(slotIndex, slots);
-        }
+                Navigator.pop(context);
+                _assignBye(slotIndex, slots);
+              }
             : null,
         onSave: (name, phone) {
           final updated = Map<int, Map<String, dynamic>>.from(slots);
@@ -641,6 +778,20 @@ class _TournamentManagementScreenState
           };
           await _persist(updated);
 
+          // Novedad automática de turno asignado
+          final endStr = endTime != null && endTime.isNotEmpty ? '–$endTime' : '';
+          await FirebaseFirestore.instance
+              .collection('clubs').doc(widget.clubId)
+              .collection('notifications').add({
+            'type':         'turno',
+            'sortKey':      DateFormat('yyyyMMddHHmm').format(DateTime.now()),
+            'message':      '📅 Turno asignado: $n1 vs $n2 · $courtName · $date $time$endStr',
+            'date':         date,
+            'time':         DateFormat('HH:mm').format(DateTime.now()),
+            'tournamentId': widget.tournamentId,
+            'createdAt':    FieldValue.serverTimestamp(),
+          });
+
           // Mandar WhatsApp a ambos si tienen teléfono
           final phone1 = (s1?['phone'] ?? '').toString();
           final phone2 = (s2?['phone'] ?? '').toString();
@@ -771,15 +922,18 @@ class _TournamentManagementScreenState
             child: Padding(
               padding: const EdgeInsets.all(60),
               child: _BracketCanvas(
-                layout:         _layout,
-                slots:          slots,
-                isAdmin:        _isAdmin,
-                onSave:         _saveResult,
-                onAddPlayer:    _isAdmin ? (i)       => _addPlayer(i, slots)              : null,
-                onEditPlayer:   _isAdmin ? (i, data) => _editPlayer(i, data, slots)       : null,
-                onDeletePlayer: _isAdmin ? (i)       => _deletePlayer(i, slots)           : null,
-                onEditScore:    _isAdmin ? (mp)      => _editScore(mp, slots)             : null,
-                onAssignTurn:   _isAdmin ? (mp)      => _showAssignTurnModal(mp, slots)   : null,
+                layout:           _layout,
+                slots:            slots,
+                isAdmin:          _isAdmin,
+                onSave:           _saveResult,
+                roundDeadlines:   _roundDeadlines,
+                onAddPlayer:      _isAdmin ? (i)       => _addPlayer(i, slots)              : null,
+                onEditPlayer:     _isAdmin ? (i, data) => _editPlayer(i, data, slots)       : null,
+                onDeletePlayer:   _isAdmin ? (i)       => _deletePlayer(i, slots)           : null,
+                onEditScore:      _isAdmin ? (mp)      => _editScore(mp, slots)             : null,
+                onAssignTurn:     _isAdmin ? (mp)      => _showAssignTurnModal(mp, slots)   : null,
+                onEditDeadline:   _isAdmin ? (r)       => _showDeadlineModal(r)             : null,
+                onNotifyOverdue:  _isAdmin ? (r, s)    => _notifyOverdueRound(r, s)         : null,
               ),
             ),
           );
@@ -855,23 +1009,29 @@ class _BracketCanvas extends StatelessWidget {
   final BracketLayout                  layout;
   final Map<int, Map<String, dynamic>> slots;
   final bool                           isAdmin;
+  final Map<int, DateTime>             roundDeadlines;
   final Function(int, int, int, List<String>, int, Map<int, Map<String, dynamic>>) onSave;
   final Function(int)?                       onAddPlayer;
   final Function(int, Map<String, dynamic>)? onEditPlayer;
   final Function(int)?                       onDeletePlayer;
   final Function(MatchPosition)?             onEditScore;
   final Function(MatchPosition)?             onAssignTurn;
+  final Function(int round)?                 onEditDeadline;
+  final Function(int round, Map<int, Map<String, dynamic>> slots)? onNotifyOverdue;
 
   const _BracketCanvas({
     required this.layout,
     required this.slots,
     required this.isAdmin,
     required this.onSave,
+    this.roundDeadlines = const {},
     this.onAddPlayer,
     this.onEditPlayer,
     this.onDeletePlayer,
     this.onEditScore,
     this.onAssignTurn,
+    this.onEditDeadline,
+    this.onNotifyOverdue,
   });
 
   String _roundLabel(int r) {
@@ -904,12 +1064,88 @@ class _BracketCanvas extends StatelessWidget {
                 final key = '${mp.round}_${mp.isLeft}';
                 if (addedLabels.contains(key)) return const SizedBox.shrink();
                 addedLabels.add(key);
+
+                final deadline = roundDeadlines[mp.round];
+                final now      = DateTime.now();
+                Color dlColor  = Colors.white38;
+                String dlText  = '';
+                bool   overdue = false;
+
+                if (deadline != null) {
+                  final daysLeft = deadline.difference(
+                      DateTime(now.year, now.month, now.day)).inDays;
+                  overdue = daysLeft < 0;
+                  if (overdue) {
+                    dlColor = Colors.redAccent;
+                    dlText  = 'VENCIÓ ${DateFormat('dd/MM').format(deadline)}';
+                  } else if (daysLeft <= 2) {
+                    dlColor = Colors.orangeAccent;
+                    dlText  = 'VENCE ${DateFormat('dd/MM').format(deadline)}';
+                  } else {
+                    dlColor = Colors.white38;
+                    dlText  = DateFormat('dd/MM').format(deadline);
+                  }
+                }
+
                 return Positioned(
-                  left: mp.x, top: mp.y - 22, width: kMatchW,
-                  child: Center(child: Text(_roundLabel(mp.round),
-                      style: const TextStyle(color: Color(0xFF2E4270),
-                          fontSize: 8, fontWeight: FontWeight.bold,
-                          letterSpacing: 2.5))),
+                  left: mp.x, top: mp.y - (deadline != null ? 38 : 22),
+                  width: kMatchW,
+                  child: GestureDetector(
+                    onTap: isAdmin ? () => onEditDeadline?.call(mp.round) : null,
+                    onLongPress: (isAdmin && overdue)
+                        ? () => onNotifyOverdue?.call(mp.round, slots)
+                        : null,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Label de ronda
+                        Text(_roundLabel(mp.round),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                                color: Color(0xFF2E4270),
+                                fontSize: 8,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 2.5)),
+
+                        // Deadline
+                        if (deadline != null) ...[
+                          const SizedBox(height: 2),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                overdue
+                                    ? Icons.warning_amber_rounded
+                                    : Icons.schedule,
+                                color: dlColor,
+                                size: 8,
+                              ),
+                              const SizedBox(width: 3),
+                              Text(dlText,
+                                  style: TextStyle(
+                                      color: dlColor,
+                                      fontSize: 7,
+                                      fontWeight: FontWeight.bold)),
+                              if (isAdmin) ...[
+                                const SizedBox(width: 3),
+                                Icon(Icons.edit,
+                                    color: dlColor.withAlpha(100), size: 7),
+                              ],
+                            ],
+                          ),
+                        ] else if (isAdmin) ...[
+                          const SizedBox(height: 2),
+                          Text('+ PLAZO',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(
+                                  color: Colors.white.withAlpha(30),
+                                  fontSize: 7,
+                                  letterSpacing: 1)),
+                        ],
+                      ],
+                    ),
+                  ),
                 );
               }),
 
@@ -1009,7 +1245,7 @@ class _MatchBox extends StatelessWidget {
               ),
               boxShadow: mp.isFinal
                   ? [BoxShadow(color: kYellow.withAlpha(15),
-                  blurRadius: 24, spreadRadius: 4)]
+                      blurRadius: 24, spreadRadius: 4)]
                   : null,
             ),
             child: Column(children: [
@@ -1036,7 +1272,7 @@ class _MatchBox extends StatelessWidget {
         if (bothPresent && !hasResult && isAdmin) ...[
           const SizedBox(height: 4),
           if (hasSlot)
-          // Mostrar turno ya asignado — tappable para cambiar
+            // Mostrar turno ya asignado — tappable para cambiar
             GestureDetector(
               onTap: () => onAssignTurn?.call(mp),
               child: Container(
@@ -1068,7 +1304,7 @@ class _MatchBox extends StatelessWidget {
               ),
             )
           else
-          // Botón para asignar turno
+            // Botón para asignar turno
             GestureDetector(
               onTap: () => onAssignTurn?.call(mp),
               child: Container(
@@ -1244,39 +1480,39 @@ class _PlayerRow extends StatelessWidget {
 
     final nameWidget = _hasPlayer
         ? (isAdmin
-        ? GestureDetector(
-      onTap: () => onEditPlayer?.call(slotIndex, data!),
-      child: Text(_name,
-        style: TextStyle(
-          color: _isWinner ? Colors.white : Colors.white70,
-          fontSize: 10, letterSpacing: 0.3,
-          fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
-          decoration: TextDecoration.underline,
-          decorationColor: Colors.white24,
-          decorationStyle: TextDecorationStyle.dotted,
-        ),
-        overflow: TextOverflow.ellipsis,
-      ),
-    )
-        : Text(
-      _hasPlayer ? _name : 'ESPERANDO...',
-      style: TextStyle(
-        color: _hasPlayer ? (_isWinner ? Colors.white : Colors.white60) : Colors.white.withAlpha(51),
-        fontSize: 10, letterSpacing: 0.3,
-        fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
-      ),
-      overflow: TextOverflow.ellipsis,
-    ))
+            ? GestureDetector(
+                onTap: () => onEditPlayer?.call(slotIndex, data!),
+                child: Text(_name,
+                  style: TextStyle(
+                    color: _isWinner ? Colors.white : Colors.white70,
+                    fontSize: 10, letterSpacing: 0.3,
+                    fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
+                    decoration: TextDecoration.underline,
+                    decorationColor: Colors.white24,
+                    decorationStyle: TextDecorationStyle.dotted,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              )
+            : Text(
+                _hasPlayer ? _name : 'ESPERANDO...',
+                style: TextStyle(
+                  color: _hasPlayer ? (_isWinner ? Colors.white : Colors.white60) : Colors.white.withAlpha(51),
+                  fontSize: 10, letterSpacing: 0.3,
+                  fontWeight: _isWinner ? FontWeight.bold : FontWeight.normal,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ))
         : (mp.round == 0 && isAdmin
-        ? GestureDetector(
-      onTap: () => onAddPlayer?.call(slotIndex),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Icon(Icons.add_circle_outline, color: Colors.white38, size: 13),
-        const SizedBox(width: 3),
-        const Text('AGREGAR', style: TextStyle(color: Colors.white38, fontSize: 9)),
-      ]),
-    )
-        : Text('ESPERANDO...', style: TextStyle(color: Colors.white.withAlpha(51), fontSize: 10)));
+            ? GestureDetector(
+                onTap: () => onAddPlayer?.call(slotIndex),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  Icon(Icons.add_circle_outline, color: Colors.white38, size: 13),
+                  const SizedBox(width: 3),
+                  const Text('AGREGAR', style: TextStyle(color: Colors.white38, fontSize: 9)),
+                ]),
+              )
+            : Text('ESPERANDO...', style: TextStyle(color: Colors.white.withAlpha(51), fontSize: 10)));
 
     if (badge == null) return nameWidget;
     return Row(mainAxisSize: MainAxisSize.min, children: [
@@ -1414,7 +1650,7 @@ class _ScoreModalState extends State<_ScoreModal> {
 
   void _save() {
     final scores = List.generate(3, (i) =>
-    '${_c1[i].text.isEmpty ? '0' : _c1[i].text}'
+        '${_c1[i].text.isEmpty ? '0' : _c1[i].text}'
         '-${_c2[i].text.isEmpty ? '0' : _c2[i].text}');
 
     switch (_specialResult) {
@@ -1426,11 +1662,11 @@ class _ScoreModalState extends State<_ScoreModal> {
         Navigator.pop(context);
         break;
       case SpecialResult.walkover:
-      // Preguntamos quién NO se presentó
+        // Preguntamos quién NO se presentó
         _showWOPicker(scores);
         break;
       case SpecialResult.abandono:
-      // Preguntamos quién abandonó
+        // Preguntamos quién abandonó
         _showAbandonoPicker(scores);
         break;
     }
@@ -2059,11 +2295,11 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
     });
   }
 
-  // Slots de hora inicio disponibles según duración
+  // Slots de hora inicio disponibles según duración — de 30 en 30
   List<String> get _timeSlots {
-    final maxHour = 22 - _durationHours.ceil();
+    final maxMin = (22 - _durationHours) * 60;
     final result  = <String>[];
-    for (int min = 7 * 60; min <= maxHour * 60; min += 60) {
+    for (int min = 7 * 60; min <= maxMin; min += 30) {
       final h = min ~/ 60;
       final m = min % 60;
       result.add('${h.toString().padLeft(2,'0')}:${m.toString().padLeft(2,'0')}');
@@ -2071,13 +2307,14 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
     return result;
   }
 
-  // Todos los slots que ocupa el bloque
+  // Todos los slots de 30 min que ocupa el bloque
   List<String> _slotsForBlock(String startTime) {
     final parts    = startTime.split(':');
     final startMin = int.parse(parts[0]) * 60 + int.parse(parts[1]);
     final totalMin = (_durationHours * 60).round();
     final result   = <String>[];
-    for (int m = startMin; m < startMin + totalMin; m += 60) {
+    // Pasos de 30 min — igual que la agenda de canchas
+    for (int m = startMin; m < startMin + totalMin; m += 30) {
       result.add('${(m ~/ 60).toString().padLeft(2,'0')}:${(m % 60).toString().padLeft(2,'0')}');
     }
     return result;
@@ -2205,7 +2442,7 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                         Expanded(
                           child: Text(
                             'Turno anterior: ${prev['courtName']} · '
-                                '${prev['date']} · ${prev['time']}',
+                            '${prev['date']} · ${prev['time']}',
                             style: const TextStyle(
                                 color: Colors.orangeAccent, fontSize: 10),
                           ),
@@ -2228,7 +2465,7 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                         builder: (ctx, child) => Theme(
                           data: ThemeData.dark().copyWith(
                             colorScheme: const ColorScheme.dark(
-                                primary: kYellow, surface: Color(0xFF1A3A34)),
+                              primary: kYellow, surface: Color(0xFF1A3A34)),
                           ),
                           child: child!,
                         ),
@@ -2354,8 +2591,8 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                           builder: (ctx, snap) {
                             final occupied = snap.hasData
                                 ? snap.data!.docs
-                                .map((d) => (d.data() as Map<String,dynamic>)['time']?.toString() ?? '')
-                                .toSet()
+                                    .map((d) => (d.data() as Map<String,dynamic>)['time']?.toString() ?? '')
+                                    .toSet()
                                 : <String>{};
 
                             final blockReason  = _blockReason(courtDoc, occupied);
@@ -2364,9 +2601,9 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                             return GestureDetector(
                               onTap: isAvailable
                                   ? () => setState(() {
-                                _selectedCourtId   = courtDoc.id;
-                                _selectedCourtName = name;
-                              })
+                                        _selectedCourtId   = courtDoc.id;
+                                        _selectedCourtName = name;
+                                      })
                                   : null,
                               child: AnimatedContainer(
                                 duration: const Duration(milliseconds: 200),
@@ -2377,15 +2614,15 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                                   color: isSelected
                                       ? kYellow.withAlpha(20)
                                       : isAvailable
-                                      ? Colors.greenAccent.withAlpha(10)
-                                      : Colors.white.withAlpha(4),
+                                          ? Colors.greenAccent.withAlpha(10)
+                                          : Colors.white.withAlpha(4),
                                   borderRadius: BorderRadius.circular(10),
                                   border: Border.all(
                                     color: isSelected
                                         ? kYellow
                                         : isAvailable
-                                        ? Colors.greenAccent.withAlpha(80)
-                                        : Colors.white.withAlpha(12),
+                                            ? Colors.greenAccent.withAlpha(80)
+                                            : Colors.white.withAlpha(12),
                                     width: isSelected ? 1.5 : 1,
                                   ),
                                 ),
@@ -2397,8 +2634,8 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                                     color: isSelected
                                         ? kYellow
                                         : isAvailable
-                                        ? Colors.greenAccent
-                                        : Colors.white24,
+                                            ? Colors.greenAccent
+                                            : Colors.white24,
                                     size: 14,
                                   ),
                                   const SizedBox(width: 10),
@@ -2407,8 +2644,8 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                                       color: isSelected
                                           ? kYellow
                                           : isAvailable
-                                          ? Colors.white
-                                          : Colors.white24,
+                                              ? Colors.white
+                                              : Colors.white24,
                                       fontSize: 12,
                                       fontWeight: isSelected
                                           ? FontWeight.bold
@@ -2426,9 +2663,9 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                                     const Icon(Icons.check_circle,
                                         color: kYellow, size: 16)
                                   else if (isAvailable)
-                                      _badge('LIBRE', Colors.greenAccent)
-                                    else
-                                      _badge(blockReason!, Colors.redAccent),
+                                    _badge('LIBRE', Colors.greenAccent)
+                                  else
+                                    _badge(blockReason!, Colors.redAccent),
                                 ]),
                               ),
                             );
@@ -2455,8 +2692,8 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                         Expanded(
                           child: Text(
                             '$_selectedCourtName · '
-                                '${_selectedTime!} – ${_endTime(_selectedTime!)} · '
-                                '${_slotsForBlock(_selectedTime!).length} slot(s)',
+                            '${_selectedTime!} – ${_endTime(_selectedTime!)} · '
+                            '${_slotsForBlock(_selectedTime!).length} slot(s)',
                             style: const TextStyle(
                                 color: kYellow, fontSize: 10),
                           ),
@@ -2472,7 +2709,7 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                     width: double.infinity,
                     child: ElevatedButton(
                       onPressed: (_selectedCourtId != null &&
-                          _selectedTime != null && !_isSaving)
+                              _selectedTime != null && !_isSaving)
                           ? _tryConfirm
                           : null,
                       style: ElevatedButton.styleFrom(
@@ -2485,22 +2722,22 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                       ),
                       child: _isSaving
                           ? const SizedBox(width: 20, height: 20,
-                          child: CircularProgressIndicator(
-                              color: Colors.black, strokeWidth: 2))
+                              child: CircularProgressIndicator(
+                                  color: Colors.black, strokeWidth: 2))
                           : Text(
-                        _selectedCourtId == null || _selectedTime == null
-                            ? 'ELEGÍ HORA Y CANCHA'
-                            : 'CONFIRMAR TURNO',
-                        style: TextStyle(
-                          color: _selectedCourtId != null &&
-                              _selectedTime != null
-                              ? Colors.black
-                              : Colors.white24,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                          letterSpacing: 1.5,
-                        ),
-                      ),
+                              _selectedCourtId == null || _selectedTime == null
+                                  ? 'ELEGÍ HORA Y CANCHA'
+                                  : 'CONFIRMAR TURNO',
+                              style: TextStyle(
+                                color: _selectedCourtId != null &&
+                                        _selectedTime != null
+                                    ? Colors.black
+                                    : Colors.white24,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                                letterSpacing: 1.5,
+                              ),
+                            ),
                     ),
                   ),
                 ],
@@ -2533,11 +2770,11 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                   fontSize: 14, fontWeight: FontWeight.bold)),
           content: Text(
             'Se cancelará el turno anterior:\n'
-                '$prevCourt · $prevDate · $prevTime\n\n'
-                'Y se creará uno nuevo:\n'
-                '$_selectedCourtName · '
-                '${DateFormat('yyyy-MM-dd').format(_selectedDate)} · '
-                '$_selectedTime – ${_endTime(_selectedTime!)}',
+            '$prevCourt · $prevDate · $prevTime\n\n'
+            'Y se creará uno nuevo:\n'
+            '$_selectedCourtName · '
+            '${DateFormat('yyyy-MM-dd').format(_selectedDate)} · '
+            '$_selectedTime – ${_endTime(_selectedTime!)}',
             style: const TextStyle(color: Colors.white70,
                 fontSize: 12, height: 1.5),
           ),
