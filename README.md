@@ -1,16 +1,17 @@
-# tennis_match_pro
+Tennis Match Pro 🎾
+Descripción
+Solución digital para la administración de torneos de tenis, permitiendo la gestión de jugadores, visualización de brackets y actualización de estadísticas en tiempo real.
 
-A new Flutter project.
+Tecnologías Utilizadas
+Frontend: Flutter & Dart.
 
-## Getting Started
+Backend: Firebase (Firestore para datos en tiempo real y Auth para gestión de usuarios).
 
-This project is a starting point for a Flutter application.
+Enfoque en Calidad (QA) y Gestión
+Como desarrollador con enfoque en QA, este proyecto incluye:
 
-A few resources to get you started if this is your first Flutter project:
+Pruebas Funcionales: Validación de la lógica de puntuación y generación de llaves (brackets).
 
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
+Gestión de Versiones: Uso de Git para el control de cambios y mantenimiento de bases estables.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+UX/UI: Diseño orientado a la facilidad de uso para coordinadores de torneos en campo.
