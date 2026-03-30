@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(flutter analyze:*)",
+      "Bash(find /c/Users/mathiewman/AndroidStudioProjects/tennis_match_pro -type d -name functions -o -type f -name *.js -o -type f -name *.ts)",
+      "Bash(grep -r \"TODO\\\\|FIXME\\\\|XXX\\\\|HACK\" /c/Users/mathiewman/AndroidStudioProjects/tennis_match_pro/lib --include=*.dart)",
+      "Bash(npm run:*)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(dart analyze:*)",
+      "Bash(grep -rn \"class.*Screen\\\\|class.*Page\\\\|class.*Widget\" /c/Users/mathiewman/AndroidStudioProjects/tennis_match_pro/lib/screens/*.dart)",
+      "Bash(wc -l /c/Users/mathiewman/AndroidStudioProjects/tennis_match_pro/lib/screens/*.dart)",
+      "Bash(xargs grep:*)",
+      "Bash(flutter clean:*)",
+      "Bash(flutter pub:*)"
+    ]
+  }
+}

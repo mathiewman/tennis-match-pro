@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Color del ícono de notificaciones push — verde lima de la app -->
+    <color name="notification_color">#CCFF00</color>
+	<color name="ic_launcher_background">#0B2218</color>
+</resources>

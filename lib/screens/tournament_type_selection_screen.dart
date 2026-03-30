@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'tournament_manual_config_screen.dart';
+import 'tournament_auto_config_screen.dart';
 
 class TournamentTypeSelectionScreen extends StatelessWidget {
   final String clubId;
@@ -40,12 +41,12 @@ class TournamentTypeSelectionScreen extends StatelessWidget {
               subtitle: 'La app organiza los cruces y pide disponibilidad a los jugadores.',
               icon: Icons.auto_awesome,
               color: const Color(0xFFCCFF00),
-              onTap: () {
-                // TODO: Implementar automático
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Próximamente disponible')),
-                );
-              },
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                    builder: (_) =>
+                        TournamentAutoConfigScreen(clubId: clubId)),
+              ),
             ),
           ],
         ),

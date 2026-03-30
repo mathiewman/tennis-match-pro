@@ -63,10 +63,34 @@ class _ClubExplorerScreenState extends State<ClubExplorerScreen> {
 
           Expanded(
             child: StreamBuilder<QuerySnapshot>(
-              stream: FirebaseFirestore.instance.collection('clubs').snapshots(),
+              stream: FirebaseFirestore.instance
+                  .collection('clubs')
+                  .where('isActive', isEqualTo: true)
+                  .snapshots(),
               builder: (context, snapshot) {
                 if (snapshot.connectionState == ConnectionState.waiting) {
                   return const Center(child: CircularProgressIndicator(color: Color(0xFFCCFF00)));
+                }
+
+                if (snapshot.hasError) {
+                  return Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.wifi_off_rounded,
+                            color: Colors.white24, size: 48),
+                        const SizedBox(height: 12),
+                        const Text('No se pudo cargar los clubes.',
+                            style: TextStyle(color: Colors.white38, fontSize: 13)),
+                        const SizedBox(height: 8),
+                        TextButton(
+                          onPressed: () => setState(() {}),
+                          child: const Text('REINTENTAR',
+                              style: TextStyle(color: Color(0xFFCCFF00))),
+                        ),
+                      ],
+                    ),
+                  );
                 }
 
                 if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {

@@ -1,14 +1,25 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import '../screens/login_screen.dart';
-import '../screens/role_selection_screen.dart';
-import '../screens/club_dashboard_screen.dart';
-import '../screens/register_club_screen.dart';
-import '../screens/home_screen.dart';
-import '../screens/admin_dashboard_screen.dart';
-import '../services/database_service.dart';
+import 'screens/login_screen.dart';
+import 'screens/onboarding_screen.dart';
+import 'screens/role_selection_screen.dart';
+import 'screens/player_home_screen.dart';
+import 'screens/admin_dashboard_screen.dart';
+import 'screens/club_dashboard_screen.dart';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTH GATE
+// Escucha el stream de autenticación de Firebase y decide qué pantalla mostrar.
+//
+// Flujo completo:
+//   Sin sesión         → LoginScreen
+//   Rol 'pending'      → RoleSelectionScreen
+//   Jugador nuevo      → OnboardingScreen  (onboardingDone == false)
+//   Jugador completo   → PlayerHomeScreen
+//   Coordinador        → ClubDashboardScreen
+//   Admin              → AdminDashboardScreen
+// ─────────────────────────────────────────────────────────────────────────────
 class AuthGate extends StatelessWidget {
   const AuthGate({super.key});
 
@@ -16,54 +27,66 @@ class AuthGate extends StatelessWidget {
   Widget build(BuildContext context) {
     return StreamBuilder<User?>(
       stream: FirebaseAuth.instance.authStateChanges(),
-      builder: (context, snapshot) {
-        if (snapshot.connectionState == ConnectionState.waiting) {
-          return const _LoadingScreen();
+      builder: (context, authSnap) {
+        // 1. Cargando estado de auth
+        if (authSnap.connectionState == ConnectionState.waiting) {
+          return const _SplashLoader();
         }
 
-        // Sin sesión → Login
-        if (!snapshot.hasData) {
+        // 2. Sin sesión → Login
+        if (!authSnap.hasData || authSnap.data == null) {
           return const LoginScreen();
         }
 
-        final uid = snapshot.data!.uid;
+        final uid = authSnap.data!.uid;
 
-        // Con sesión → escuchar perfil del usuario
+        // 3. Con sesión → escuchar el doc del usuario en Firestore
         return StreamBuilder<DocumentSnapshot<Map<String, dynamic>>>(
           stream: FirebaseFirestore.instance
-              .collection('users').doc(uid).snapshots(),
+              .collection('users')
+              .doc(uid)
+              .snapshots(),
           builder: (context, userSnap) {
             if (userSnap.connectionState == ConnectionState.waiting) {
-              return const _LoadingScreen();
+              return const _SplashLoader();
             }
 
-            // Doc aún no creado (raro pero posible en el primer login)
+            // Doc no existe todavía (puede pasar en el primer frame)
             if (!userSnap.hasData || !userSnap.data!.exists) {
-              return const _LoadingScreen();
+              return const _SplashLoader();
             }
 
-            final userData = userSnap.data!.data() ?? {};
-            final String role = userData['role'] ?? 'pending';
+            final data = userSnap.data!.data()!;
+            final role           = data['role']           as String? ?? 'pending';
+            final onboardingDone = data['onboardingDone'] as bool?   ?? false;
 
+            // 4. Sin rol → elegir rol
+            if (role == 'pending') {
+              return const RoleSelectionScreen();
+            }
+
+            // 5. Jugador sin onboarding → onboarding
+            if (role == 'player' && !onboardingDone) {
+              return const OnboardingScreen();
+            }
+
+            // 6. Redirigir según rol
             switch (role) {
-
-              // ── Coordinador ─────────────────────────────────────────────
-              case 'coordinator':
-                return _CoordinatorGate(uid: uid, userData: userData);
-
-              // ── Admin ───────────────────────────────────────────────────
               case 'admin':
                 return const AdminDashboardScreen();
 
-              // ── Jugador / Coach ─────────────────────────────────────────
-              case 'player':
-              case 'coach':
-                return HomeScreen(userData: userData);
+              case 'coordinator':
+                final clubId = data['clubId'] as String? ?? '';
+                if (clubId.isEmpty) {
+                  // Coordinador sin club → que lo registre
+                  // (el ClubDashboardScreen maneja este caso internamente)
+                  return ClubDashboardScreen(clubId: '');
+                }
+                return ClubDashboardScreen(clubId: clubId);
 
-              // ── Sin rol — elegir rol ────────────────────────────────────
-              case 'pending':
+              case 'player':
               default:
-                return const RoleSelectionScreen();
+                return PlayerHomeScreen(userData: data);
             }
           },
         );
@@ -73,54 +96,31 @@ class AuthGate extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// COORDINADOR GATE — verifica si ya tiene club, si no lo manda a crearlo
+// SPLASH LOADER — pantalla de carga mientras se resuelve el estado
 // ─────────────────────────────────────────────────────────────────────────────
-class _CoordinatorGate extends StatelessWidget {
-  final String uid;
-  final Map<String, dynamic> userData;
-
-  const _CoordinatorGate({required this.uid, required this.userData});
-
-  @override
-  Widget build(BuildContext context) {
-    return FutureBuilder<Map<String, dynamic>?>(
-      future: DatabaseService().getClubByOwner(uid),
-      builder: (context, snap) {
-        if (snap.connectionState == ConnectionState.waiting) {
-          return const _LoadingScreen();
-        }
-
-        final clubData = snap.data;
-
-        // Ya tiene club → ir directo al dashboard
-        if (clubData != null) {
-          final clubId = clubData['id']?.toString() ?? '';
-          if (clubId.isNotEmpty) {
-            return ClubDashboardScreen(clubId: clubId);
-          }
-        }
-
-        // No tiene club → crear uno
-        return const RegisterClubScreen();
-      },
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// PANTALLA DE CARGA — mientras se resuelven las queries
-// ─────────────────────────────────────────────────────────────────────────────
-class _LoadingScreen extends StatelessWidget {
-  const _LoadingScreen();
+class _SplashLoader extends StatelessWidget {
+  const _SplashLoader();
 
   @override
   Widget build(BuildContext context) {
     return const Scaffold(
       backgroundColor: Color(0xFF0A1F1A),
       body: Center(
-        child: CircularProgressIndicator(
-          valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFCCFF00)),
-          strokeWidth: 2.5,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(color: Color(0xFFCCFF00)),
+            SizedBox(height: 20),
+            Text(
+              'TENNIS MATCH PRO',
+              style: TextStyle(
+                color: Color(0xFFCCFF00),
+                fontSize: 13,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 3,
+              ),
+            ),
+          ],
         ),
       ),
     );

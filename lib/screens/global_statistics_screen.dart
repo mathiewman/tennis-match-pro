@@ -3,41 +3,10 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../services/weather_service.dart';
+import '../services/notification_service.dart';
 import '../models/court_model.dart';
 import '../services/database_service.dart';
 import 'court_schedule_screen.dart';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPER DE NOVEDADES
-// ─────────────────────────────────────────────────────────────────────────────
-class NotificationService {
-  static Future<void> write({
-    required String clubId,
-    required String type,
-    required String message,
-    Map<String, dynamic> extra = const {},
-  }) async {
-    final now     = DateTime.now();
-    final dateStr = DateFormat('yyyy-MM-dd').format(now);
-    final timeStr = DateFormat('HH:mm').format(now);
-    // sortKey = 'yyyyMMddHHmm' — permite orderBy sin índice compuesto
-    final sortKey = DateFormat('yyyyMMddHHmm').format(now);
-    try {
-      await FirebaseFirestore.instance
-          .collection('clubs').doc(clubId)
-          .collection('notifications')
-          .add({
-        'type':      type,
-        'message':   message,
-        'date':      dateStr,
-        'time':      timeStr,
-        'sortKey':   sortKey,
-        'createdAt': FieldValue.serverTimestamp(),
-        ...extra,
-      });
-    } catch (_) {}
-  }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MODELO DE EVENTO DEL DÍA

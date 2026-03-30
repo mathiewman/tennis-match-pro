@@ -2,42 +2,89 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import '../models/tournament_model.dart';
-import '../services/database_service.dart';
 
-class TournamentFixtureScreen extends StatefulWidget {
-  final String clubId;
-  const TournamentFixtureScreen({super.key, required this.clubId});
+class TournamentFixtureScreen extends StatelessWidget {
+  final String tournamentId;
+  final String tournamentName;
 
-  @override
-  State<TournamentFixtureScreen> createState() => _TournamentFixtureScreenState();
-}
+  const TournamentFixtureScreen({
+    super.key,
+    required this.tournamentId,
+    this.tournamentName = 'Fixture',
+  });
 
-class _TournamentFixtureScreenState extends State<TournamentFixtureScreen> {
-  final DatabaseService _dbService = DatabaseService();
-  final List<String> _rounds = ['Octavos', 'Cuartos', 'Semis', 'Final'];
+  static const _kRounds = [
+    'GRAN FINAL', 'SEMIFINAL', 'CUARTOS', 'OCTAVOS',
+    'RONDA 5', 'RONDA 4', 'RONDA 3', 'RONDA 2', 'RONDA 1',
+  ];
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF1A3A34),
       appBar: AppBar(
-        title: const Text('Fixture del Torneo', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        title: Text(tournamentName.toUpperCase(),
+            style: const TextStyle(
+                color: Colors.white, fontWeight: FontWeight.bold)),
         backgroundColor: Colors.transparent,
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
       ),
-      body: ListView.builder(
-        padding: const EdgeInsets.all(16),
-        itemCount: _rounds.length,
-        itemBuilder: (context, index) {
-          final round = _rounds[index];
-          return _buildRoundSection(round);
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('tournaments')
+            .doc(tournamentId)
+            .collection('matches')
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) {
+            return const Center(
+                child: CircularProgressIndicator(color: Color(0xFFCCFF00)));
+          }
+          final docs = snapshot.data!.docs;
+          if (docs.isEmpty) {
+            return const Center(
+              child: Text(
+                'Todavía no hay partidos registrados.\nEl admin genera el bracket desde el panel.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white38, fontSize: 13),
+              ),
+            );
+          }
+
+          // Group by round in a deterministic order
+          final grouped = <String, List<TournamentMatch>>{};
+          for (final doc in docs) {
+            final match = TournamentMatch.fromFirestore(
+                doc as DocumentSnapshot<Map<String, dynamic>>);
+            grouped.putIfAbsent(match.round, () => []).add(match);
+          }
+
+          // Sort rounds by the canonical order
+          final roundOrder = _kRounds;
+          final sortedRounds = grouped.keys.toList()
+            ..sort((a, b) {
+              final ia = roundOrder.indexOf(a);
+              final ib = roundOrder.indexOf(b);
+              final ra = ia == -1 ? 999 : ia;
+              final rb = ib == -1 ? 999 : ib;
+              return ra.compareTo(rb);
+            });
+
+          return ListView.builder(
+            padding: const EdgeInsets.all(16),
+            itemCount: sortedRounds.length,
+            itemBuilder: (context, index) {
+              final round = sortedRounds[index];
+              return _buildRoundSection(round, grouped[round]!);
+            },
+          );
         },
       ),
     );
   }
 
-  Widget _buildRoundSection(String round) {
+  Widget _buildRoundSection(String round, List<TournamentMatch> matches) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -45,35 +92,14 @@ class _TournamentFixtureScreenState extends State<TournamentFixtureScreen> {
           padding: const EdgeInsets.symmetric(vertical: 15),
           child: Text(
             round.toUpperCase(),
-            style: const TextStyle(color: Color(0xFFCCFF00), fontSize: 18, fontWeight: FontWeight.bold, letterSpacing: 1.2),
+            style: const TextStyle(
+                color: Color(0xFFCCFF00),
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.2),
           ),
         ),
-        StreamBuilder<QuerySnapshot>(
-          stream: FirebaseFirestore.instance
-              .collection('tournaments')
-              .doc('manual_torneo_${widget.clubId}')
-              .collection('matches')
-              .where('round', isEqualTo: round)
-              .snapshots(),
-          builder: (context, snapshot) {
-            if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-            final matches = snapshot.data!.docs;
-
-            if (matches.isEmpty) {
-              return const Padding(
-                padding: EdgeInsets.only(left: 10, bottom: 20),
-                child: Text('Sin partidos definidos en esta ronda.', style: TextStyle(color: Colors.white24, fontSize: 12)),
-              );
-            }
-
-            return Column(
-              children: matches.map((doc) {
-                final match = TournamentMatch.fromFirestore(doc as DocumentSnapshot<Map<String, dynamic>>);
-                return _buildMatchCard(match);
-              }).toList(),
-            );
-          },
-        ),
+        ...matches.map((match) => _buildMatchCard(match)),
         const Divider(color: Colors.white10, height: 40),
       ],
     );

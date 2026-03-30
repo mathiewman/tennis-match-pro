@@ -1,5 +1,6 @@
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/foundation.dart';
 import '../models/player_model.dart';
 import '../models/club_model.dart';
 import '../models/court_model.dart';
@@ -159,10 +160,16 @@ class DatabaseService {
   }
 
   // --- ADMIN METHODS ---
-  Future<void> assignCoins(String uid, int amount, {String? clubId}) async {
+  Future<void> assignCoins(String uid, int amount, {String? clubId, String reason = 'Asignación manual'}) async {
     await _db.collection(usersCollection).doc(uid).update({
       'balance_coins': FieldValue.increment(amount),
     });
+    await logCoinTransaction(
+      uid: uid,
+      amount: amount,
+      type: 'admin_assign',
+      description: reason,
+    );
     // Novedad: asignación de coins
     if (clubId != null && clubId.isNotEmpty) {
       final userDoc = await _db.collection(usersCollection).doc(uid).get();
@@ -170,6 +177,28 @@ class DatabaseService {
       await _notify(clubId, 'coins',
           '💰 Se asignaron $amount coins a $name');
     }
+  }
+
+  /// Registra toda operación de coins en coin_transactions/{uid}/entries
+  Future<void> logCoinTransaction({
+    required String uid,
+    required int amount,       // positivo = crédito, negativo = débito
+    required String type,      // 'admin_assign', 'tournament_inscription', 'tournament_refund', 'match_challenge', 'match_refund', 'purchase'
+    required String description,
+    int? balanceAfter,
+  }) async {
+    try {
+      await _db
+          .collection('users').doc(uid)
+          .collection('coin_transactions').add({
+        'amount':      amount,
+        'type':        type,
+        'description': description,
+        'balanceAfter': balanceAfter,
+        'createdAt':   FieldValue.serverTimestamp(),
+        'date':        DateTime.now().toIso8601String(),
+      });
+    } catch (e) { debugPrint('[DatabaseService] Error: $e'); }
   }
 
   Future<void> createMockUsers(int count) async {
@@ -259,7 +288,11 @@ class DatabaseService {
         .doc(clubId)
         .collection(courtsSubcollection)
         .snapshots()
-        .map((snapshot) => snapshot.docs.map((doc) => Court.fromFirestore(doc)).toList());
+        .map((snapshot) {
+          final courts = snapshot.docs.map((doc) => Court.fromFirestore(doc)).toList();
+          courts.sort((a, b) => a.courtName.compareTo(b.courtName));
+          return courts;
+        });
   }
 
   // --- AGENDA & SLOTS LOGIC ---

@@ -17,6 +17,12 @@ class Player {
   final String? admin_club_id;
   final Timestamp? availableDate;
   final String? availableTimeSlot;
+  final String? apodo;
+  final String? category;
+  final String? manoHabil;
+  final String? reves;
+  final String? altura;
+  final String? peso;
 
   Player({
     required this.id,
@@ -35,25 +41,37 @@ class Player {
     this.admin_club_id,
     this.availableDate,
     this.availableTimeSlot,
+    this.apodo,
+    this.category,
+    this.manoHabil,
+    this.reves,
+    this.altura,
+    this.peso,
   });
 
   Map<String, dynamic> toMap() {
     return {
-      'displayName': displayName,
-      'email': email,
-      'photoUrl': photoUrl,
-      'eloRating': eloRating,
-      'tennisLevel': tennisLevel,
-      'preferredHand': preferredHand,
-      'status': status,
-      'location': location,
-      'availability': availability,
-      'dateOfBirth': dateOfBirth,
-      'balance_coins': balance_coins,
-      'role': role,
-      'admin_club_id': admin_club_id,
-      'availableDate': availableDate,
+      'displayName':      displayName,
+      'email':            email,
+      'photoUrl':         photoUrl,
+      'eloRating':        eloRating,
+      'tennisLevel':      tennisLevel,
+      'preferredHand':    preferredHand,
+      'status':           status,
+      'location':         location,
+      'availability':     availability,
+      'dateOfBirth':      dateOfBirth,
+      'balance_coins':    balance_coins,
+      'role':             role,
+      'admin_club_id':    admin_club_id,
+      'availableDate':    availableDate,
       'availableTimeSlot': availableTimeSlot,
+      'apodo':            apodo,
+      'category':         category,
+      'manoHabil':        manoHabil,
+      'reves':            reves,
+      'altura':           altura,
+      'peso':             peso,
     };
   }
 
@@ -76,6 +94,12 @@ class Player {
       admin_club_id: data['admin_club_id'],
       availableDate: data['availableDate'] as Timestamp?,
       availableTimeSlot: data['availableTimeSlot'],
+      apodo:     data['apodo'],
+      category:  data['category'],
+      manoHabil: data['manoHabil'],
+      reves:     data['reves'],
+      altura:    data['altura']?.toString(),
+      peso:      data['peso']?.toString(),
     );
   }
 }

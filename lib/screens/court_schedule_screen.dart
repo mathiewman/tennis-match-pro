@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../services/weather_service.dart';
+import '../services/notification_service.dart' show NotificationService;
 import 'pricing_config_screen.dart' show ClubPricing;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1264,10 +1265,16 @@ class _CourtScheduleScreenState extends State<CourtScheduleScreen> {
   }
 
   Future<void> _deleteTorneoBlock(QueryDocumentSnapshot res) async {
-    final data       = res.data() as Map<String, dynamic>;
+    final data         = res.data() as Map<String, dynamic>;
     final tournamentId = data['tournamentId']?.toString() ?? '';
-    final blockStart = data['blockStart']?.toString() ?? data['time']?.toString() ?? '';
-    final dateStr    = data['date']?.toString() ?? '';
+    final blockStart   = data['blockStart']?.toString() ?? data['time']?.toString() ?? '';
+    final dateStr      = data['date']?.toString() ?? '';
+
+    // Guarda: si no hay tournamentId, borrar solo este slot
+    if (tournamentId.isEmpty) {
+      await res.reference.delete();
+      return;
+    }
 
     // 1. Borrar todos los slots del bloque en la cancha
     final snap = await FirebaseFirestore.instance

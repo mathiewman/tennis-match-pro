@@ -4,6 +4,8 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:intl/intl.dart';
+import '../models/tournament_model.dart';
+import '../services/push_notification_service.dart';
 import 'stats_calculator.dart';
 import 'tournament_stats_screen.dart';
 
@@ -244,7 +246,8 @@ class TournamentManagementScreen extends StatefulWidget {
 class _TournamentManagementScreenState
     extends State<TournamentManagementScreen> {
 
-  String _userRole  = 'player';
+  String _userRole          = 'player';
+  String _tournamentStatus  = 'open'; // normalized status
   bool   _isLoading = true;
   late final BracketLayout _layout;
   RankingConfig _rankingConfig = const RankingConfig();
@@ -270,16 +273,27 @@ class _TournamentManagementScreenState
 
   Future<void> _loadUserRole() async {
     final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      final doc = await FirebaseFirestore.instance
-          .collection('users').doc(user.uid).get();
-      if (mounted) setState(() {
-        _userRole  = doc.data()?['role'] ?? 'player';
-        _isLoading = false;
-      });
-    } else {
-      if (mounted) setState(() => _isLoading = false);
-    }
+    final futures = await Future.wait([
+      if (user != null)
+        FirebaseFirestore.instance.collection('users').doc(user.uid).get()
+      else
+        Future.value(null),
+      FirebaseFirestore.instance
+          .collection('tournaments')
+          .doc(widget.tournamentId)
+          .get(),
+    ]);
+
+    if (mounted) setState(() {
+      final userDoc = futures[0] as DocumentSnapshot?;
+      _userRole = userDoc?.data() != null
+          ? ((userDoc!.data() as Map<String, dynamic>)['role'] ?? 'player')
+          : 'player';
+      final tDoc = futures[1] as DocumentSnapshot;
+      _tournamentStatus = normalizeTournamentStatus(
+          (tDoc.data() as Map<String, dynamic>?)?['status']?.toString() ?? 'open');
+      _isLoading = false;
+    });
   }
 
   Future<void> _loadRankingConfig() async {
@@ -455,6 +469,7 @@ class _TournamentManagementScreenState
         'name':          w['name']     ?? '',
         'phone':         w['phone']    ?? '',
         'photoUrl':      w['photoUrl'] ?? '',
+        'uid':           w['uid']      ?? '',
         'score':         [],
         'winner':        false,
         'specialResult': 'normal',
@@ -465,6 +480,52 @@ class _TournamentManagementScreenState
     }
     _persist(updated).then((_) async {
       _triggerStatsRecalc(updated);
+
+      // ── Write-through a matches subcollection (schema permanente) ──────────
+      // Permite queries por ronda, historial de jugador, etc.
+      try {
+        final mp = _layout.matches.firstWhere(
+          (m) => (m.slotP1 == p1 && m.slotP2 == p2) ||
+                 (m.slotP1 == p2 && m.slotP2 == p1),
+          orElse: () => _layout.matches.first,
+        );
+        // Solo persiste si encontramos el match correcto
+        if ((mp.slotP1 == p1 && mp.slotP2 == p2) ||
+            (mp.slotP1 == p2 && mp.slotP2 == p1)) {
+          final roundLabel  = _roundLabel(mp.round);
+          final p1uid       = updated[p1]?['uid']?.toString()         ?? '';
+          final p2uid       = updated[p2]?['uid']?.toString()         ?? '';
+          final p1name      = updated[p1]?['name']?.toString()        ?? '';
+          final p2name      = updated[p2]?['name']?.toString()        ?? '';
+          final winnerUid   = updated[winnerSlot]?['uid']?.toString() ?? '';
+          final matchDocId  = 'r${mp.round}_s${mp.slotP1}_s${mp.slotP2}';
+
+          await FirebaseFirestore.instance
+              .collection('tournaments')
+              .doc(widget.tournamentId)
+              .collection('matches')
+              .doc(matchDocId)
+              .set({
+            'tournamentId':   widget.tournamentId,
+            'player1Id':      p1uid,
+            'player1Name':    p1name,
+            'player2Id':      p2uid,
+            'player2Name':    p2name,
+            'winnerId':       winnerUid,
+            'score':          score,
+            'round':          roundLabel,
+            'status':         'played',
+            'specialResult':  specialResult ?? 'normal',
+            'slotP1':         mp.slotP1,
+            'slotP2':         mp.slotP2,
+            'isManualSync':   true,
+            'updatedAt':      FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+        }
+      } catch (e) {
+        debugPrint('[Tournament] Write-through matches error: $e');
+      }
+
       // Novedad automática
       final n1w = updated[winnerSlot]?['name'] ?? '';
       final nLose = updated[loserSlot]?['name'] ?? '';
@@ -491,8 +552,97 @@ class _TournamentManagementScreenState
         'tournamentId': widget.tournamentId,
         'createdAt':    FieldValue.serverTimestamp(),
       });
+      // Actualizar ELO (no bloquea: falla silenciosamente si no hay uid)
+      _updateElo(winnerSlot, loserSlot, updated, specialResult);
+      _awardMatchCoins(winnerSlot, updated, specialResult, nextSlot == -1);
     });
   }
+  // ── ELO RATING UPDATE ─────────────────────────────────────────────────────
+  /// Actualiza ELO de ganador y perdedor usando la fórmula estándar (K=32).
+  /// Solo aplica si el slot tiene uid (jugadores inscriptos, no manuales).
+  /// W.O. y BYE no modifican ELO.
+  Future<void> _updateElo(
+      int winnerSlot, int loserSlot,
+      Map<int, Map<String, dynamic>> slots,
+      String? specialResult) async {
+    if (specialResult == 'walkover' || specialResult == 'bye') return;
+
+    final winnerUid = slots[winnerSlot]?['uid']?.toString() ?? '';
+    final loserUid  = slots[loserSlot]?['uid']?.toString()  ?? '';
+    if (winnerUid.isEmpty || loserUid.isEmpty) return;
+
+    try {
+      final db = FirebaseFirestore.instance;
+      final winDoc = await db.collection('users').doc(winnerUid).get();
+      final losDoc = await db.collection('users').doc(loserUid).get();
+      if (!winDoc.exists || !losDoc.exists) return;
+
+      final winElo = ((winDoc.data()?['eloRating']) ?? 1000) as int;
+      final losElo = ((losDoc.data()?['eloRating']) ?? 1000) as int;
+
+      const k = 32.0;
+      final eW = 1.0 / (1.0 + pow(10, (losElo - winElo) / 400.0));
+      final eL = 1.0 - eW;
+
+      final newWinElo = (winElo + k * (1 - eW)).round();
+      final newLosElo = (losElo + k * (0 - eL)).round().clamp(100, 3000);
+
+      await db.collection('users').doc(winnerUid).update({'eloRating': newWinElo});
+      await db.collection('users').doc(loserUid).update({'eloRating': newLosElo});
+
+      debugPrint('ELO actualizado: $winnerUid $winElo→$newWinElo | $loserUid $losElo→$newLosElo');
+    } catch (e) {
+      debugPrint('ELO update error: $e');
+    }
+  }
+
+  /// Premia al ganador de un partido con coins.
+  /// Si es el partido final (nextSlot == -1), también da el premio de campeón.
+  Future<void> _awardMatchCoins(
+      int winnerSlot, Map<int, Map<String, dynamic>> slots,
+      String? specialResult, bool isFinal) async {
+    if (specialResult == 'walkover' || specialResult == 'bye') return;
+
+    final winnerUid = slots[winnerSlot]?['uid']?.toString() ?? '';
+    if (winnerUid.isEmpty) return;
+
+    try {
+      final db = FirebaseFirestore.instance;
+
+      // Leer configuración del torneo
+      final tDoc = await db.collection('tournaments').doc(widget.tournamentId).get();
+      final coinsPerPartido = ((tDoc.data()?['coinsPerPartido']) ?? 50) as int;
+      final premioCoins     = ((tDoc.data()?['premioCoins'])     ?? 0)  as int;
+
+      int totalAward = coinsPerPartido;
+      if (isFinal && premioCoins > 0) totalAward += premioCoins;
+
+      if (totalAward <= 0) return;
+
+      await db.collection('users').doc(winnerUid).update({
+        'balance_coins': FieldValue.increment(totalAward),
+      });
+
+      // Log transacción
+      final winnerName = slots[winnerSlot]?['name'] ?? 'Jugador';
+      final desc = isFinal
+          ? '🏆 Campeón del torneo + victoria: +$totalAward coins'
+          : '🎾 Victoria en partido: +$coinsPerPartido coins';
+      await db.collection('users').doc(winnerUid)
+          .collection('coin_transactions').add({
+        'amount':      totalAward,
+        'type':        isFinal ? 'tournament_champion' : 'match_win',
+        'description': desc,
+        'createdAt':   FieldValue.serverTimestamp(),
+        'date':        DateTime.now().toIso8601String(),
+      });
+
+      debugPrint('Coins premiadas: $winnerName +$totalAward (final: $isFinal)');
+    } catch (e) {
+      debugPrint('Error premiando coins: $e');
+    }
+  }
+
   /// Marca un slot vacío como BYE — el jugador del slot opuesto avanza automáticamente.
   void _assignBye(int emptySlot, Map<int, Map<String, dynamic>> slots) {
     final mp = _layout.matchForSlot(emptySlot);
@@ -521,12 +671,13 @@ class _TournamentManagementScreenState
     // Avanzar al ganador al siguiente slot
     if (mp.nextSlot != -1) {
       updated[mp.nextSlot] = {
-        'name':     opponent['name']     ?? '',
-        'phone':    opponent['phone']    ?? '',
-        'photoUrl': opponent['photoUrl'] ?? '',
-        'score':    [],
-        'winner':   false,
-        'hadBye':   true,
+        'name':          opponent['name']     ?? '',
+        'phone':         opponent['phone']    ?? '',
+        'photoUrl':      opponent['photoUrl'] ?? '',
+        'uid':           opponent['uid']      ?? '',
+        'score':         [],
+        'winner':        false,
+        'hadBye':        true,
         'specialResult': 'normal',
       };
     }
@@ -900,6 +1051,12 @@ class _TournamentManagementScreenState
     return Scaffold(
       backgroundColor: kBg,
       appBar: _buildAppBar(),
+      // Banner de deadline vencida — solo visible para admin cuando el torneo
+      // sigue "open" y la fecha de inscripción ya pasó.
+      bottomNavigationBar: _isAdmin && _tournamentStatus == 'open'
+          ? _DeadlineBanner(tournamentId: widget.tournamentId,
+                            onDraw: _showDrawModal)
+          : null,
       body: StreamBuilder<DocumentSnapshot>(
         stream: _layoutDoc.snapshots(),
         builder: (context, snapshot) {
@@ -942,6 +1099,94 @@ class _TournamentManagementScreenState
     );
   }
 
+  // ── SORTEO DE JUGADORES ───────────────────────────────────────────────────
+  Future<void> _showDrawModal() async {
+    // Leer inscriptos del torneo
+    final inscSnap = await FirebaseFirestore.instance
+        .collection('tournaments')
+        .doc(widget.tournamentId)
+        .collection('inscriptions')
+        .get();
+
+    if (!mounted) return;
+
+    if (inscSnap.docs.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('No hay jugadores inscriptos en este torneo.'),
+        backgroundColor: Colors.orangeAccent,
+      ));
+      return;
+    }
+
+    final players = inscSnap.docs.map((d) {
+      final data = d.data();
+      return {
+        'uid':         d.id,
+        'name':        data['displayName']?.toString() ?? 'Jugador',
+        'phone':       '',
+        'photoUrl':    data['photoUrl']?.toString() ?? '',
+      };
+    }).toList();
+
+    if (!mounted) return;
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF0D1220),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (_) => _DrawModal(
+        players:      players,
+        slotCount:    _layout.playerCount,
+        onConfirm:    _applyDraw,
+      ),
+    );
+  }
+
+  Future<void> _applyDraw(List<Map<String, dynamic>> orderedPlayers) async {
+    // Construir mapa de slots con los jugadores asignados
+    final updated = <int, Map<String, dynamic>>{};
+    for (int i = 0; i < orderedPlayers.length && i < _layout.playerCount; i++) {
+      updated[i] = {
+        'name':     orderedPlayers[i]['name']     ?? '',
+        'phone':    orderedPlayers[i]['phone']    ?? '',
+        'photoUrl': orderedPlayers[i]['photoUrl'] ?? '',
+        'uid':      orderedPlayers[i]['uid']      ?? '',
+        'score':    [],
+        'winner':   false,
+      };
+    }
+
+    await _persist(updated);
+
+    // Actualizar estado del torneo a 'en_curso'
+    await FirebaseFirestore.instance
+        .collection('tournaments')
+        .doc(widget.tournamentId)
+        .update({'status': 'en_curso'});
+
+    // Notificar a cada jugador inscripto que el bracket está listo
+    for (final player in orderedPlayers) {
+      final uid = player['uid']?.toString() ?? '';
+      if (uid.isEmpty) continue;
+      PushNotificationService.sendToUser(
+        toUid: uid,
+        title: '🎾 ¡El sorteo está listo!',
+        body:  'Tu primer partido en ${widget.tournamentName} ya está definido. Revisá el bracket.',
+        type:  NotifType.matchSlot,
+        extra: {'tournamentId': widget.tournamentId},
+      );
+    }
+
+    if (mounted) {
+      setState(() => _tournamentStatus = 'en_curso');
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('¡Sorteo realizado! El torneo está en curso.'),
+        backgroundColor: Color(0xFF1A4D32),
+      ));
+    }
+  }
+
   AppBar _buildAppBar() => AppBar(
     backgroundColor: Colors.black,
     elevation: 0,
@@ -958,7 +1203,14 @@ class _TournamentManagementScreenState
               fontSize: 9, letterSpacing: 1.5)),
     ]),
     actions: [
-      // ← NUEVO: botón de estadísticas
+      // Botón de sorteo — solo visible para admin cuando el torneo está abierto
+      if (_isAdmin && _tournamentStatus == 'open')
+        IconButton(
+          icon: const Icon(Icons.shuffle_rounded, color: kYellow, size: 22),
+          tooltip: 'Generar sorteo',
+          onPressed: _showDrawModal,
+        ),
+      // Botón de estadísticas
       IconButton(
         icon: const Icon(Icons.bar_chart_rounded, color: Colors.white70, size: 20),
         tooltip: 'Estadísticas',
@@ -1000,6 +1252,82 @@ class _TournamentManagementScreenState
       ),
     ],
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BANNER DEADLINE VENCIDA
+// ─────────────────────────────────────────────────────────────────────────────
+/// Muestra un banner en la parte inferior cuando la fecha de inscripción venció
+/// y el torneo todavía está en estado 'open'. Sugiere generar el sorteo.
+class _DeadlineBanner extends StatelessWidget {
+  final String      tournamentId;
+  final VoidCallback onDraw;
+
+  const _DeadlineBanner({
+    required this.tournamentId,
+    required this.onDraw,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<DocumentSnapshot>(
+      future: FirebaseFirestore.instance
+          .collection('tournaments')
+          .doc(tournamentId)
+          .get(),
+      builder: (ctx, snap) {
+        if (!snap.hasData) return const SizedBox.shrink();
+        final data     = snap.data!.data() as Map<String, dynamic>? ?? {};
+        final dlTs     = data['inscriptionDeadline'] as Timestamp?;
+        if (dlTs == null) return const SizedBox.shrink();
+        final deadline = dlTs.toDate();
+        if (!deadline.isBefore(DateTime.now())) return const SizedBox.shrink();
+
+        // Deadline pasó — mostrar banner
+        return Container(
+          color: const Color(0xFF0A0F1E),
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 16),
+          child: SafeArea(
+            top: false,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.orangeAccent.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: Colors.orangeAccent.withOpacity(0.4)),
+              ),
+              child: Row(children: [
+                const Icon(Icons.timer_off_rounded,
+                    color: Colors.orangeAccent, size: 20),
+                const SizedBox(width: 10),
+                const Expanded(
+                  child: Text(
+                    'La inscripción venció. ¿Generás el bracket ahora?',
+                    style: TextStyle(color: Colors.white70, fontSize: 12),
+                  ),
+                ),
+                TextButton(
+                  onPressed: onDraw,
+                  style: TextButton.styleFrom(
+                    backgroundColor: Colors.orangeAccent.withOpacity(0.15),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 6),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8)),
+                  ),
+                  child: const Text('SORTEAR',
+                      style: TextStyle(
+                          color: Colors.orangeAccent,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold)),
+                ),
+              ]),
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1366,10 +1694,6 @@ class _PlayerRow extends StatelessWidget {
   String get _name       => _hasPlayer ? (data!['name'] as String).toUpperCase() : '';
   bool   get _isWinner   => data?['winner'] == true;
   bool   get _isBye      => data?['isBye'] == true || data?['name'] == 'BYE';
-  // W.O.: badge solo en el AUSENTE (absent == true), no en el ganador
-  bool   get _isWalkover => data?['absent'] == true;
-  // Abandono: badge solo en el que ABANDONÓ (abandono == true), no en el ganador
-  bool   get _isAbandono => data?['abandono'] == true;
 
   @override
   Widget build(BuildContext context) {
@@ -2267,8 +2591,6 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
   double   _durationHours    = 2.0;
   bool     _isSaving         = false;
 
-  // Cache de reservas por cancha: courtId → Set<time>
-  final Map<String, Set<String>> _occupiedByCount = {};
   // Streams activos por cancha
   final Map<String, Stream<QuerySnapshot>> _courtStreams = {};
   // Datos de canchas (nombre, hasLights)
@@ -2595,8 +2917,9 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                                     .toSet()
                                 : <String>{};
 
-                            final blockReason  = _blockReason(courtDoc, occupied);
-                            final isAvailable  = blockReason == null;
+                            final String? blockReasonRaw = _blockReason(courtDoc, occupied);
+                            final blockReason  = blockReasonRaw ?? '';
+                            final isAvailable  = blockReasonRaw == null;
 
                             return GestureDetector(
                               onTap: isAvailable
@@ -2665,7 +2988,7 @@ class _AssignTurnModalState extends State<_AssignTurnModal> {
                                   else if (isAvailable)
                                     _badge('LIBRE', Colors.greenAccent)
                                   else
-                                    _badge(blockReason!, Colors.redAccent),
+                                    _badge(blockReason, Colors.redAccent),
                                 ]),
                               ),
                             );
@@ -2972,4 +3295,431 @@ class _BgGridPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_BgGridPainter old) => false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MODAL DE SORTEO — aleatorio o manual
+// ─────────────────────────────────────────────────────────────────────────────
+class _DrawModal extends StatefulWidget {
+  final List<Map<String, dynamic>> players;
+  final int slotCount;
+  final Future<void> Function(List<Map<String, dynamic>>) onConfirm;
+
+  const _DrawModal({
+    required this.players,
+    required this.slotCount,
+    required this.onConfirm,
+  });
+
+  @override
+  State<_DrawModal> createState() => _DrawModalState();
+}
+
+class _DrawModalState extends State<_DrawModal> {
+  bool _isRandom = true;
+  bool _saving   = false;
+
+  // Para sorteo manual: lista de slots, cada uno con el jugador asignado (o null)
+  late List<Map<String, dynamic>?> _manualSlots;
+  // Jugadores aún sin asignar
+  late List<Map<String, dynamic>> _unassigned;
+
+  @override
+  void initState() {
+    super.initState();
+    _manualSlots = List.filled(widget.slotCount, null);
+    _unassigned  = List.from(widget.players);
+  }
+
+  List<Map<String, dynamic>> _randomOrder() {
+    final shuffled = List<Map<String, dynamic>>.from(widget.players)
+      ..shuffle(Random());
+    return shuffled;
+  }
+
+  Future<void> _confirm() async {
+    setState(() => _saving = true);
+    try {
+      final List<Map<String, dynamic>> ordered;
+      if (_isRandom) {
+        ordered = _randomOrder();
+      } else {
+        // Solo los slots asignados; los vacíos no generan entrada
+        ordered = _manualSlots
+            .where((s) => s != null)
+            .cast<Map<String, dynamic>>()
+            .toList();
+      }
+      await widget.onConfirm(ordered);
+      if (mounted) Navigator.pop(context);
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _assignToSlot(int slotIdx, Map<String, dynamic> player) {
+    setState(() {
+      // Si ya estaba en otro slot, liberar ese slot
+      for (int i = 0; i < _manualSlots.length; i++) {
+        if (_manualSlots[i]?['uid'] == player['uid']) {
+          _manualSlots[i] = null;
+        }
+      }
+      // Si el slot ya tenía alguien, devolverlo a no asignados
+      final prev = _manualSlots[slotIdx];
+      if (prev != null) {
+        _unassigned.add(prev);
+      }
+      _manualSlots[slotIdx] = player;
+      _unassigned.removeWhere((p) => p['uid'] == player['uid']);
+    });
+  }
+
+  void _clearSlot(int slotIdx) {
+    final prev = _manualSlots[slotIdx];
+    if (prev == null) return;
+    setState(() {
+      _manualSlots[slotIdx] = null;
+      _unassigned.add(prev);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottom = MediaQuery.of(context).padding.bottom;
+    return DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.85,
+      minChildSize: 0.5,
+      maxChildSize: 0.95,
+      builder: (ctx, scrollCtrl) => Padding(
+        padding: EdgeInsets.only(bottom: bottom),
+        child: Column(children: [
+          // Handle
+          Container(
+            margin: const EdgeInsets.symmetric(vertical: 12),
+            width: 40, height: 4,
+            decoration: BoxDecoration(
+              color: Colors.white24,
+              borderRadius: BorderRadius.circular(2)),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Row(children: [
+              const Text('GENERAR SORTEO',
+                  style: TextStyle(color: Colors.white,
+                      fontSize: 16, fontWeight: FontWeight.bold)),
+              const Spacer(),
+              // Toggle modo
+              GestureDetector(
+                onTap: () => setState(() => _isRandom = !_isRandom),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 12, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: kYellow.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(color: kYellow.withOpacity(0.3)),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(
+                      _isRandom ? Icons.shuffle : Icons.edit_outlined,
+                      color: kYellow, size: 14),
+                    const SizedBox(width: 6),
+                    Text(
+                      _isRandom ? 'ALEATORIO' : 'MANUAL',
+                      style: const TextStyle(
+                          color: kYellow,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold)),
+                  ]),
+                ),
+              ),
+            ]),
+          ),
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24),
+            child: Text(
+              _isRandom
+                  ? '${widget.players.length} jugadores inscriptos · se sortearán al azar'
+                  : 'Asigná cada jugador a una posición del bracket',
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Divider(color: Colors.white10, height: 1),
+          Expanded(
+            child: _isRandom
+                ? _buildRandomPreview(scrollCtrl)
+                : _buildManualAssign(scrollCtrl),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 16),
+            child: SizedBox(
+              width: double.infinity,
+              height: 52,
+              child: ElevatedButton(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: kYellow,
+                  foregroundColor: Colors.black,
+                  elevation: 0,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14)),
+                ),
+                onPressed: _saving ? null : _confirm,
+                child: _saving
+                    ? const SizedBox(
+                        width: 20, height: 20,
+                        child: CircularProgressIndicator(
+                            strokeWidth: 2.5, color: Colors.black))
+                    : Text(
+                        _isRandom
+                            ? 'SORTEAR Y COMENZAR TORNEO'
+                            : 'CONFIRMAR Y COMENZAR TORNEO',
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                            letterSpacing: 0.5)),
+              ),
+            ),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  Widget _buildRandomPreview(ScrollController ctrl) {
+    return ListView.builder(
+      controller: ctrl,
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+      itemCount: widget.players.length,
+      itemBuilder: (_, i) {
+        final p     = widget.players[i];
+        final photo = p['photoUrl']?.toString() ?? '';
+        return Container(
+          margin: const EdgeInsets.only(bottom: 8),
+          padding: const EdgeInsets.symmetric(
+              horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.white.withOpacity(0.04),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(children: [
+            Container(
+              width: 28, height: 28,
+              decoration: BoxDecoration(
+                color: kYellow.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Center(
+                child: Text('${i + 1}',
+                    style: const TextStyle(
+                        color: kYellow, fontSize: 10,
+                        fontWeight: FontWeight.bold)),
+              ),
+            ),
+            const SizedBox(width: 12),
+            CircleAvatar(
+              radius: 16,
+              backgroundColor: const Color(0xFF1A3A34),
+              backgroundImage: photo.isNotEmpty
+                  ? NetworkImage(photo) : null,
+              child: photo.isEmpty
+                  ? const Icon(Icons.person,
+                      size: 16, color: Colors.white38)
+                  : null,
+            ),
+            const SizedBox(width: 10),
+            Text(p['name']?.toString() ?? 'Jugador',
+                style: const TextStyle(
+                    color: Colors.white, fontSize: 13)),
+            const Spacer(),
+            const Icon(Icons.shuffle, color: Colors.white24, size: 14),
+          ]),
+        );
+      },
+    );
+  }
+
+  Widget _buildManualAssign(ScrollController ctrl) {
+    return ListView(
+      controller: ctrl,
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+      children: [
+        // Jugadores sin asignar
+        if (_unassigned.isNotEmpty) ...[
+          const Text('JUGADORES SIN ASIGNAR',
+              style: TextStyle(color: Colors.white38,
+                  fontSize: 9, fontWeight: FontWeight.bold,
+                  letterSpacing: 1.5)),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8, runSpacing: 8,
+            children: _unassigned.map((p) {
+              final photo = p['photoUrl']?.toString() ?? '';
+              return GestureDetector(
+                onTap: () {
+                  // Asignar al primer slot libre
+                  final freeIdx = _manualSlots.indexWhere(
+                      (s) => s == null);
+                  if (freeIdx != -1) _assignToSlot(freeIdx, p);
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: kYellow.withOpacity(0.08),
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                        color: kYellow.withOpacity(0.3)),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    CircleAvatar(
+                      radius: 10,
+                      backgroundColor: const Color(0xFF1A3A34),
+                      backgroundImage: photo.isNotEmpty
+                          ? NetworkImage(photo) : null,
+                      child: photo.isEmpty
+                          ? const Icon(Icons.person,
+                              size: 10, color: Colors.white38)
+                          : null,
+                    ),
+                    const SizedBox(width: 6),
+                    Text(p['name']?.toString() ?? 'Jugador',
+                        style: const TextStyle(
+                            color: kYellow, fontSize: 11)),
+                  ]),
+                ),
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 16),
+        ],
+        // Slots del bracket
+        const Text('POSICIONES EN EL BRACKET',
+            style: TextStyle(color: Colors.white38,
+                fontSize: 9, fontWeight: FontWeight.bold,
+                letterSpacing: 1.5)),
+        const SizedBox(height: 8),
+        ...List.generate(widget.slotCount, (i) {
+          final assigned = _manualSlots[i];
+          final photo    = assigned?['photoUrl']?.toString() ?? '';
+          return GestureDetector(
+            onTap: assigned != null
+                ? () => _clearSlot(i)
+                : () {
+                    // Si hay no asignados, mostrar selector
+                    if (_unassigned.isNotEmpty) {
+                      _showPlayerSelector(i);
+                    }
+                  },
+            child: Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.symmetric(
+                  horizontal: 14, vertical: 10),
+              decoration: BoxDecoration(
+                color: assigned != null
+                    ? Colors.greenAccent.withOpacity(0.05)
+                    : Colors.white.withOpacity(0.03),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(
+                  color: assigned != null
+                      ? Colors.greenAccent.withOpacity(0.2)
+                      : Colors.white.withOpacity(0.06),
+                ),
+              ),
+              child: Row(children: [
+                Container(
+                  width: 24, height: 24,
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.06),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Center(
+                    child: Text('${i + 1}',
+                        style: const TextStyle(
+                            color: Colors.white38, fontSize: 9,
+                            fontWeight: FontWeight.bold)),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                if (assigned != null) ...[
+                  CircleAvatar(
+                    radius: 14,
+                    backgroundColor: const Color(0xFF1A3A34),
+                    backgroundImage: photo.isNotEmpty
+                        ? NetworkImage(photo) : null,
+                    child: photo.isEmpty
+                        ? const Icon(Icons.person,
+                            size: 14, color: Colors.white38)
+                        : null,
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                        assigned['name']?.toString() ?? 'Jugador',
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 13)),
+                  ),
+                  const Icon(Icons.close,
+                      color: Colors.white38, size: 14),
+                ] else ...[
+                  const Expanded(
+                    child: Text('Tocar para asignar jugador',
+                        style: TextStyle(
+                            color: Colors.white24, fontSize: 12)),
+                  ),
+                  const Icon(Icons.add_circle_outline,
+                      color: Colors.white24, size: 16),
+                ],
+              ]),
+            ),
+          );
+        }),
+      ],
+    );
+  }
+
+  void _showPlayerSelector(int slotIdx) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF131824),
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(16))),
+      builder: (_) => ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          const Text('SELECCIONÁ UN JUGADOR',
+              style: TextStyle(color: Colors.white38,
+                  fontSize: 10, fontWeight: FontWeight.bold,
+                  letterSpacing: 1.5)),
+          const SizedBox(height: 12),
+          ..._unassigned.map((p) {
+            final photo = p['photoUrl']?.toString() ?? '';
+            return ListTile(
+              contentPadding: EdgeInsets.zero,
+              leading: CircleAvatar(
+                radius: 18,
+                backgroundColor: const Color(0xFF1A3A34),
+                backgroundImage: photo.isNotEmpty
+                    ? NetworkImage(photo) : null,
+                child: photo.isEmpty
+                    ? const Icon(Icons.person,
+                        size: 18, color: Colors.white38)
+                    : null,
+              ),
+              title: Text(p['name']?.toString() ?? 'Jugador',
+                  style: const TextStyle(
+                      color: Colors.white, fontSize: 13)),
+              onTap: () {
+                Navigator.pop(context);
+                _assignToSlot(slotIdx, p);
+              },
+            );
+          }),
+        ],
+      ),
+    );
+  }
 }

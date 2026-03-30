@@ -1,11 +1,14 @@
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'court_management_screen.dart';
 import 'global_statistics_screen.dart';
 import 'tournament_list_screen.dart';
 import 'pricing_config_screen.dart';
+import 'club_store_screen.dart';
+import 'players_management_screen.dart';
 
 class ClubDashboardScreen extends StatefulWidget {
   final String clubId;
@@ -49,6 +52,42 @@ class _ClubDashboardScreenState extends State<ClubDashboardScreen> {
         backgroundColor: Colors.transparent,
         elevation: 0,
         iconTheme: const IconThemeData(color: Colors.white),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout, color: Colors.white54, size: 20),
+            tooltip: 'Cerrar sesión',
+            onPressed: () async {
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (dlgCtx) => AlertDialog(
+                  backgroundColor: const Color(0xFF0D1F1A),
+                  title: const Text('Cerrar sesión',
+                      style: TextStyle(color: Colors.white, fontSize: 16)),
+                  content: const Text('¿Salir de tu cuenta?',
+                      style: TextStyle(color: Colors.white54)),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(dlgCtx, false),
+                      child: const Text('CANCELAR',
+                          style: TextStyle(color: Colors.white38)),
+                    ),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFCCFF00)),
+                      onPressed: () => Navigator.pop(dlgCtx, true),
+                      child: const Text('SALIR',
+                          style: TextStyle(color: Colors.black,
+                              fontWeight: FontWeight.bold)),
+                    ),
+                  ],
+                ),
+              );
+              if (ok == true && context.mounted) {
+                await FirebaseAuth.instance.signOut();
+              }
+            },
+          ),
+        ],
       ),
       body: RefreshIndicator(
         color: const Color(0xFFCCFF00),
@@ -79,7 +118,7 @@ class _ClubDashboardScreenState extends State<ClubDashboardScreen> {
             crossAxisCount: 3,
             mainAxisSpacing: 12,
             crossAxisSpacing: 12,
-            childAspectRatio: 1.1,
+            childAspectRatio: 1.05,
             children: [
               _gridItem(context,
                   title: 'TORNEOS',
@@ -94,13 +133,15 @@ class _ClubDashboardScreenState extends State<ClubDashboardScreen> {
                   color: const Color(0xFFCCFF00),
                   onTap: () => Navigator.push(context,
                       MaterialPageRoute(
-                          builder: (_) => const CourtManagementScreen()))),
+                          builder: (_) => CourtManagementScreen(clubId: widget.clubId)))),
               _gridItem(context,
                   title: 'JUGADORES',
                   icon: Icons.groups,
                   color: Colors.blueAccent,
-                  onTap: () => Navigator.pushNamed(
-                      context, '/tournament_players', arguments: widget.clubId)),
+                  onTap: () => Navigator.push(context,
+                      MaterialPageRoute(
+                          builder: (_) => PlayersManagementScreen(
+                              clubId: widget.clubId)))),
               _gridItem(context,
                   title: 'TARIFAS',
                   icon: Icons.attach_money,
@@ -109,6 +150,15 @@ class _ClubDashboardScreenState extends State<ClubDashboardScreen> {
                       MaterialPageRoute(
                           builder: (_) =>
                               PricingConfigScreen(clubId: widget.clubId)))),
+              _gridItem(context,
+                  title: 'TIENDA',
+                  icon: Icons.storefront,
+                  color: Colors.tealAccent,
+                  onTap: () => Navigator.push(context,
+                      MaterialPageRoute(
+                          builder: (_) => ClubStoreScreen(
+                              clubId:   widget.clubId,
+                              clubName: '')))),
               _gridItem(context,
                   title: 'AGENDA',
                   icon: Icons.bar_chart_rounded,

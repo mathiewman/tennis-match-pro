@@ -1,83 +1,129 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:google_sign_in/google_sign_in.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'push_notification_service.dart'; // ← AGREGADO
 
 class AuthService {
-  final FirebaseAuth _auth = FirebaseAuth.instance;
-  final GoogleSignIn _googleSignIn = GoogleSignIn();
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
+  final FirebaseAuth      _auth         = FirebaseAuth.instance;
+  final GoogleSignIn      _googleSignIn = GoogleSignIn();
+  final FirebaseFirestore _db           = FirebaseFirestore.instance;
 
-  static const String adminEmail = 'matiasdlr9@gmail.com';
-
+  // ── SIGN IN CON GOOGLE ───────────────────────────────────────────────────
   Future<UserCredential?> signInWithGoogle() async {
     try {
-      try {
+      // Forzar selector de cuenta
+      if (await _googleSignIn.isSignedIn()) {
         await _googleSignIn.signOut();
-      } catch (_) {}
-      
+      }
+
       final GoogleSignInAccount? googleUser = await _googleSignIn.signIn();
       if (googleUser == null) return null;
 
-      final GoogleSignInAuthentication googleAuth = await googleUser.authentication;
-      final AuthCredential credential = GoogleAuthProvider.credential(
+      final GoogleSignInAuthentication googleAuth =
+          await googleUser.authentication;
+
+      final credential = GoogleAuthProvider.credential(
         accessToken: googleAuth.accessToken,
-        idToken: googleAuth.idToken,
+        idToken:     googleAuth.idToken,
       );
 
+      // Solo esto es crítico — si falla, retorna null con sign-out implícito
       final userCredential = await _auth.signInWithCredential(credential);
-      
-      if (userCredential.user != null) {
-        await _ensureUserInFirestore(userCredential.user!);
-      }
+
+      // Firestore y FCM van en background: NO bloquean la navegación.
+      // El AuthGate tiene su propio timeout de seguridad.
+      _ensureUserInFirestore(userCredential.user!);
+      PushNotificationService.refreshToken();
 
       return userCredential;
     } catch (e) {
-      print('Error during Google sign-in: $e');
       return null;
     }
   }
 
-  Future<void> _ensureUserInFirestore(User user) async {
-    final docRef = _db.collection('users').doc(user.uid);
-    final doc = await docRef.get();
-
-    if (!doc.exists) {
-      String initialRole = (user.email == adminEmail) ? 'admin' : 'pending';
-
-      final userData = {
-        'uid': user.uid,
-        'displayName': user.displayName ?? 'Sin Nombre',
-        'email': user.email ?? '',
-        'photoURL': user.photoURL,
-        'role': initialRole,
-        'createdAt': FieldValue.serverTimestamp(),
-        'balance_coins': 0,
-      };
-      
-      await docRef.set(userData);
-    } else {
-      if (user.email == adminEmail && doc.data()?['role'] != 'admin') {
-        await docRef.update({'role': 'admin'});
-      }
-    }
-  }
-
-  // Método restaurado para la selección de rol
-  Future<void> updateUserRole(String uid, String newRole) async {
-    await _db.collection('users').doc(uid).update({'role': newRole});
-  }
-
+  // ── SIGN OUT COMPLETO ────────────────────────────────────────────────────
   Future<void> signOut() async {
     try {
-      await _googleSignIn.disconnect().catchError((_) => null);
-      await _googleSignIn.signOut().catchError((_) => null);
+      // Eliminar el FCM token del dispositivo antes de cerrar sesión
+      await PushNotificationService.removeToken();
+
       await _auth.signOut();
-      print("Sesión cerrada y desconectada correctamente.");
-    } catch (e) {
-      print('Error signing out: $e');
-      await _auth.signOut();
-    }
+      await _googleSignIn.signOut();
+      try {
+        await _googleSignIn.disconnect();
+      } catch (_) {}
+    } catch (_) {}
   }
 
-  Stream<User?> get userStream => _auth.authStateChanges();
+  // ── ROL Y PERFIL ─────────────────────────────────────────────────────────
+  Future<String?> getUserRole(String uid) async {
+    final doc = await _db.collection('users').doc(uid).get();
+    return doc.data()?['role'] as String?;
+  }
+
+  Future<void> updateUserRole(String uid, String role) async {
+    await _db.collection('users').doc(uid).update({'role': role});
+  }
+
+  // ── GUARDAR NIVEL DE TENIS (llamar desde onboarding) ─────────────────────
+  Future<void> saveTennisLevel(String uid, String level) async {
+    await _db.collection('users').doc(uid).update({
+      'tennisLevel':    level,
+      'onboardingDone': true,
+    });
+  }
+
+  // ── GUARDAR DATOS COMPLETOS DE ONBOARDING (nivel + categoría + club) ───────
+  Future<void> saveOnboardingData(
+      String uid, String level, String category, {
+      String? homeClubId, String? homeClubName}) async {
+    await _db.collection('users').doc(uid).update({
+      'tennisLevel':    level,
+      'category':       category,
+      'onboardingDone': true,
+      if (homeClubId != null && homeClubId.isNotEmpty)
+        'homeClubId': homeClubId,
+      if (homeClubName != null && homeClubName.isNotEmpty)
+        'homeClubName': homeClubName,
+    });
+  }
+
+  // ── CREAR / ACTUALIZAR USUARIO EN FIRESTORE ──────────────────────────────
+  // Se llama sin await — corre en background.
+  // Nunca debe dejar excepciones sin manejar (Dart las loguea como unhandled).
+  Future<void> _ensureUserInFirestore(User user) async {
+    try {
+      final docRef = _db.collection('users').doc(user.uid);
+      final doc    = await docRef.get();
+
+      if (!doc.exists) {
+        // Usuario nuevo — crear perfil inicial
+        await docRef.set({
+          'uid':            user.uid,
+          'displayName':    user.displayName ?? 'Sin Nombre',
+          'email':          user.email ?? '',
+          'photoUrl':       user.photoURL ?? '',
+          'role':           'pending',
+          'tennisLevel':    '',
+          'onboardingDone': false,
+          'balance_coins':  0,
+          'isAvailable':    false,
+          'eloRating':      1000,
+          'createdAt':      DateTime.now().toIso8601String(),
+        });
+      } else {
+        // Usuario existente — actualizar campos básicos sin tocar photoUrl
+        // (el usuario gestiona su propia foto desde el perfil)
+        final existing = doc.data()!;
+        await docRef.update({
+          'displayName':   user.displayName ?? existing['displayName'] ?? '',
+          'email':         user.email       ?? existing['email']       ?? '',
+          'googlePhotoUrl': user.photoURL   ?? '',
+          'lastLoginAt':   DateTime.now().toIso8601String(),
+        });
+      }
+    } catch (_) {
+      // Fallo silencioso — el AuthGate tiene timeout de seguridad para nuevos usuarios
+    }
+  }
 }

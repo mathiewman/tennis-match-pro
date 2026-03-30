@@ -177,14 +177,25 @@ class _MatchRequestScreenState extends State<MatchRequestScreen> {
     return Container(
       padding: const EdgeInsets.all(20),
       color: Colors.white,
-      child: ElevatedButton(
-        style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFFCCFF00),
-          minimumSize: const Size(double.infinity, 55),
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
-        ),
-        onPressed: _selectedSlotId != null ? () => Navigator.pop(context) : null,
-        child: const Text('CONFIRMAR ENCUENTRO', style: TextStyle(color: Colors.black, fontWeight: FontWeight.bold)),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.grey.shade300,
+              minimumSize: const Size(double.infinity, 55),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(15)),
+            ),
+            onPressed: null, // Próximamente — funcionalidad en desarrollo
+            child: const Text('CONFIRMAR ENCUENTRO',
+                style: TextStyle(color: Colors.grey, fontWeight: FontWeight.bold)),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Función disponible próximamente',
+            style: TextStyle(color: Colors.grey, fontSize: 12),
+          ),
+        ],
       ),
     );
   }

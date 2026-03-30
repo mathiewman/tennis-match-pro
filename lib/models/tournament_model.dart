@@ -1,5 +1,15 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 
+// ── Normaliza valores de status viejos a los nuevos ──────────────────────────
+String normalizeTournamentStatus(String raw) {
+  switch (raw) {
+    case 'setup':  return 'open';
+    case 'active': return 'en_curso';
+    case 'done':   return 'terminado';
+    default:       return raw; // 'proximamente', 'open', 'en_curso', 'terminado'
+  }
+}
+
 class Tournament {
   final String id;
   final String name;
@@ -12,6 +22,8 @@ class Tournament {
   final String? promoUrl;
   final String? creatorId;
   final int setsPerMatch; // 1, 3 or 5
+  final String status;   // 'proximamente', 'open', 'en_curso', 'terminado'
+  final Timestamp? inscriptionDeadline;
 
   Tournament({
     required this.id,
@@ -25,6 +37,8 @@ class Tournament {
     this.promoUrl,
     this.creatorId,
     this.setsPerMatch = 3,
+    this.status = 'open',
+    this.inscriptionDeadline,
   });
 
   Map<String, dynamic> toMap() {
@@ -39,6 +53,8 @@ class Tournament {
       'promoUrl': promoUrl,
       'creatorId': creatorId,
       'setsPerMatch': setsPerMatch,
+      'status': status,
+      'inscriptionDeadline': inscriptionDeadline,
     };
   }
 
@@ -56,6 +72,8 @@ class Tournament {
       promoUrl: data['promoUrl'],
       creatorId: data['creatorId'],
       setsPerMatch: data['setsPerMatch'] ?? 3,
+      status: normalizeTournamentStatus(data['status']?.toString() ?? 'open'),
+      inscriptionDeadline: data['inscriptionDeadline'] as Timestamp?,
     );
   }
 }

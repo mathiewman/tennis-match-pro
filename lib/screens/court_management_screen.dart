@@ -1,3 +1,4 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import '../services/database_service.dart';
@@ -5,7 +6,10 @@ import '../models/court_model.dart';
 import 'court_schedule_screen.dart';
 
 class CourtManagementScreen extends StatefulWidget {
-  const CourtManagementScreen({super.key});
+  /// Si se pasa clubId, se usa directamente sin buscar por ownerId.
+  /// Útil para el admin que entra a un club ajeno.
+  final String? clubId;
+  const CourtManagementScreen({super.key, this.clubId});
 
   @override
   State<CourtManagementScreen> createState() => _CourtManagementScreenState();
@@ -24,11 +28,24 @@ class _CourtManagementScreenState extends State<CourtManagementScreen> {
   }
 
   Future<void> _loadMyClub() async {
+    // Si viene clubId externo (admin), usarlo directamente
+    if (widget.clubId != null && widget.clubId!.isNotEmpty) {
+      final doc = await FirebaseFirestore.instance
+          .collection('clubs').doc(widget.clubId).get();
+      if (mounted && doc.exists) {
+        setState(() {
+          _myClub    = {...doc.data()!, 'id': doc.id};
+          _isLoading = false;
+        });
+      }
+      return;
+    }
+    // Coordinador normal: buscar por ownerId
     if (_uid != null) {
       final club = await _dbService.getClubByOwner(_uid!);
       if (mounted) {
         setState(() {
-          _myClub = club;
+          _myClub    = club;
           _isLoading = false;
         });
       }
